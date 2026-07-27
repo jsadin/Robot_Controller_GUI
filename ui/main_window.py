@@ -17,6 +17,13 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 
+# 必须在 import PyQt5 之前加载 elite_cs_sdk，否则 Windows 上会与 Qt 发生
+# 原生库冲突（进程直接 0xC0000005 退出，点「连接」后进不了主界面）。
+try:
+    import elite_cs_sdk  # noqa: F401
+except ImportError:
+    pass
+
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication,

@@ -1,4 +1,4 @@
-"""兼容入口：先加载 elite_cs_sdk，再启动 GUI。"""
+"""python -m ui 入口：先预加载 SDK，再启动主窗口。"""
 
 try:
     import elite_cs_sdk  # noqa: F401
