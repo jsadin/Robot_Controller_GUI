@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.idea/
+.vscode/
+*.log
+config/devices.local.yaml
+data/
+*.exe
+.DS_Store
+_patch_main_window.py
+_xlsx_preview.txt
+
+# 旧仓保留在本地作对照，不纳入新 monorepo（代码已迁入 devices/ui/tasks）
+SLAM/
+ES66/
+

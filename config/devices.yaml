@@ -1,0 +1,34 @@
+# 统一设备配置（现场可改；密钥勿提交 devices.local.yaml）
+pc:
+  local_ip: "192.168.11.10"   # 机械臂 reverse socket 回连本机，必填可达地址
+
+chassis:
+  host: "192.168.11.1"
+  port: 1448
+  timeout_s: 4.0
+
+arm:
+  kind: mock                  # mock | elite_cs
+  host: "192.168.11.150"
+  max_joint_speed_deg_s: 45.0
+  speed_limit_enabled: true
+  headless_mode: true
+  servoj_timeout_ms: 300
+
+camera:
+  kind: hikvision             # hikvision | rtsp | usb | mock
+  host: "192.168.11.101"
+  user: "admin"
+  password: ""                # 或环境变量 ROBOT_CAMERA_PASSWORD
+  port: 554
+  stream_path: "/h264/ch1/main/av_stream"
+  rtsp_url: ""                # 非空则优先于 hikvision 组装
+  usb_index: 0
+
+ranging:
+  enabled: false
+  host: ""
+  port: 0
+
+paths:
+  data_dir: ""                # 空则使用 ~/.robot_controller
