@@ -46,7 +46,21 @@ python -m ui.main_window --offline
 ## 打包（可选）
 
 ```bash
-pyinstaller --noconfirm --windowed --name RobotControllerGUI ui/main_window.py
+pyinstaller --noconfirm RobotControllerGUI.spec
 ```
 
 真机臂需事先安装 `elite_cs_sdk` wheel。
+
+## Git 远程
+
+本地已 `git init` 并完成首次提交。若需上传 GitHub：
+
+1. 在 GitHub 新建空仓库 `Robot_Controller_GUI`（不要勾选 README）
+2. 执行：
+
+```bash
+git remote add origin https://github.com/<你的用户名>/Robot_Controller_GUI.git
+git push -u origin main
+```
+
+（若已配置 `origin` 指向 `jsadin/Robot_Controller_GUI`，创建空仓后直接 `git push -u origin main` 即可。）
