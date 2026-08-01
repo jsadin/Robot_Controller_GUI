@@ -802,7 +802,7 @@ class MainWindow(QMainWindow):
     # ---- 遥控 / 调速 (功能表 #5 #6) ----
 
     def on_move_tick(self, direction: int) -> None:
-        """遥控连发: 周期收到方向 -> move_by（带 UI 速度比例）。"""
+        """遥控连发: 周期收到方向 -> move_by（带 UI 速度）。"""
         if not self.client:
             return
         # 急停激活时拒绝发送运动指令, 并停止连发定时器
@@ -811,7 +811,21 @@ class MainWindow(QMainWindow):
             return
         try:
             ratio = self.control.teleop_speed_ratio(direction)
-            self.client.move_by(direction, speed_ratio=ratio)
+            # 同时传 speed_ratio(比例) 与绝对速度, 由固件选用;
+            # 实测 speed_ratio 在部分固件无效, 绝对速度字段更可靠。
+            from devices.chassis import DIR_TURN_LEFT, DIR_TURN_RIGHT
+            if direction in (DIR_TURN_LEFT, DIR_TURN_RIGHT):
+                self.client.move_by(
+                    direction,
+                    speed_ratio=ratio,
+                    angular_velocity=self.control.current_angular_rps(),
+                )
+            else:
+                self.client.move_by(
+                    direction,
+                    speed_ratio=ratio,
+                    linear_velocity=self.control.current_linear_mps(),
+                )
         except HermesError as e:
             self.control._stop()
             self.status(f"遥控失败: {e}")

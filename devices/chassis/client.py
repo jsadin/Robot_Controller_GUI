@@ -548,20 +548,30 @@ class HermesClient:
         }
         return self.create_action(ACTION_SERIES_MOVE_TO, options)
 
-    def move_by(self, direction: int, speed_ratio: float = 0.0) -> dict:
+    def move_by(self, direction: int, speed_ratio: float = 0.0,
+               linear_velocity: float = 0.0,
+               angular_velocity: float = 0.0) -> dict:
         """方向遥控(功能表 #6 方向键前后左右)。
 
         direction: 整数方向枚举(实机已确认)
             0=前进  1=后退  2=左转  3=右转
-        speed_ratio: 可选速度比例(0~1), 0 表示用默认速度。
+        speed_ratio: 速度比例(0~1), 部分固件支持; 0=默认。
+        linear_velocity: 绝对线速度 m/s, 部分固件支持(前进/后退方向生效)。
+        angular_velocity: 绝对角速度 rad/s, 部分固件支持(转向方向生效)。
+
+        注: 不同固件对速度字段的支持不一致; 同时传多个字段由固件自行选用,
+        以 linear/angular_velocity 为优先(绝对值更可靠)。
+
         MoveByAction 需要被周期性(如每 100~200ms)重复调用才能持续运动,
         松开按键即停止调用并 cancel, 底盘随之停下。
-
-        返回的 state 结构: {"reason","result","status"}, status/result 为整数码。
         """
         options: dict = {"direction": direction}
         if speed_ratio:
             options["speed_ratio"] = speed_ratio
+        if linear_velocity > 0:
+            options["linear_velocity"] = round(linear_velocity, 4)
+        if angular_velocity > 0:
+            options["angular_velocity"] = round(angular_velocity, 4)
         return self.create_action(ACTION_MOVE_BY, options)
 
     def go_home(self) -> dict:
