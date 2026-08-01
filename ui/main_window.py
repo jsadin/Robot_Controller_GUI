@@ -123,6 +123,7 @@ class MainWindow(QMainWindow):
             on_change=self.on_task_change,
         )
         self._last_sched_check = None   # 上次调度检查的分钟, 防同分钟重复
+        self._status_pinned_until = 0.0  # 重要状态消息的固定截止时间(monotonic)
 
         # 顶部工具条
         self.status_light = QLabel("●")
@@ -465,8 +466,12 @@ class MainWindow(QMainWindow):
 
     # ---- 通用 ----
 
-    def status(self, msg: str) -> None:
+    def status(self, msg: str, pin_secs: float = 0.0) -> None:
+        """在状态栏显示消息。pin_secs>0 时固定该消息若干秒, poll 不覆盖。"""
+        import time
         self.statusBar().showMessage(msg)
+        if pin_secs > 0:
+            self._status_pinned_until = time.monotonic() + pin_secs
 
     def _vline(self) -> QFrame:
         """工具栏分组竖分隔线。"""
@@ -562,9 +567,21 @@ class MainWindow(QMainWindow):
         if not self.client:
             return
         try:
-            strategies = self.client.get_strategies()
+            raw_strategies = self.client.get_strategies()
+            # 策略列表可能是 list[dict] 或 list[str]，统一提取 id 字段
+            strategy_ids = []
+            for s in raw_strategies:
+                if isinstance(s, dict):
+                    strategy_ids.append(s.get("id") or s.get("name") or str(s))
+                else:
+                    strategy_ids.append(str(s))
             current = self.client.get_current_strategy()
-            self.control.set_strategies(strategies, str(current))
+            # current 可能是 dict 或 str，提取 id
+            if isinstance(current, dict):
+                current_id = current.get("id") or current.get("name") or ""
+            else:
+                current_id = str(current)
+            self.control.set_strategies(strategy_ids, current_id)
             self.control.set_speeds(
                 self.client.get_max_speed(),
                 self.client.get_max_angular_speed(),
@@ -788,6 +805,10 @@ class MainWindow(QMainWindow):
         """遥控连发: 周期收到方向 -> move_by（带 UI 速度比例）。"""
         if not self.client:
             return
+        # 急停激活时拒绝发送运动指令, 并停止连发定时器
+        if self.estop_bus.latched:
+            self.control._stop()
+            return
         try:
             ratio = self.control.teleop_speed_ratio(direction)
             self.client.move_by(direction, speed_ratio=ratio)
@@ -824,9 +845,9 @@ class MainWindow(QMainWindow):
             self.client.set_max_speed(speed)
             got = self.client.get_max_speed()
             self.control.set_speeds(got, self.client.get_max_angular_speed())
-            self.status(f"最大线速度已设为 {got:.2f} m/s（读回确认）")
+            self.status(f"最大线速度已设为 {got:.2f} m/s（读回确认）", pin_secs=4.0)
         except HermesError as e:
-            self.status(f"线速度设置失败: {e}")
+            self.status(f"线速度设置失败: {e}", pin_secs=4.0)
 
     def on_max_angular(self, speed: float) -> None:
         if not self.client:
@@ -835,9 +856,9 @@ class MainWindow(QMainWindow):
             self.client.set_max_angular_speed(speed)
             got = self.client.get_max_angular_speed()
             self.control.set_speeds(self.client.get_max_speed(), got)
-            self.status(f"最大角速度已设为 {got:.2f} rad/s（读回确认）")
+            self.status(f"最大角速度已设为 {got:.2f} rad/s（读回确认）", pin_secs=4.0)
         except HermesError as e:
-            self.status(f"角速度设置失败: {e}")
+            self.status(f"角速度设置失败: {e}", pin_secs=4.0)
 
     # ---- 安全: 急停 / 刹车释放 ----
 
@@ -857,11 +878,11 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             self.control.set_estop_state(True)
-            self.status("已触发系统急停")
+            self.status("已触发系统急停", pin_secs=8.0)
             return
         self.estop_bus.release()
         self.control.set_estop_state(False)
-        self.status("已解除软件急停")
+        self.status("已解除软件急停", pin_secs=4.0)
 
     def on_brake_release(self, release: bool) -> None:
         """刹车释放(可手推)/恢复制动。"""
@@ -1067,7 +1088,10 @@ class MainWindow(QMainWindow):
         n_warn = sum(1 for e in errs if e.get("level", 0) == 1)
         self._set_health_button(n_err, n_warn)
         # 同步急停按钮(物理急停或他处触发时, 界面也反映)
-        self.control.set_estop_state(h.get("emergency_stop", False))
+        # 软件急停已 latch 时不覆盖按钮状态, 避免物理急停解除后错误清除 UI
+        hw_estop = h.get("emergency_stop", False)
+        if not self.estop_bus.latched:
+            self.control.set_estop_state(hw_estop)
         # 定位质量低提示
         try:
             q = self.client.get_localization_quality()
@@ -1274,6 +1298,7 @@ class MainWindow(QMainWindow):
     # ---- 定时轮询 (功能表 #2 #15) ----
 
     def poll(self) -> None:
+        import time
         if not self.client:
             return
         try:
@@ -1285,7 +1310,9 @@ class MainWindow(QMainWindow):
                 f"电量 {p.battery_percentage}%  "
                 f"{'充电中' if p.is_charging else p.docking_status}"
             )
-            self.status(base + self._action_suffix() + self._loc_quality_hint)
+            # 重要消息固定期间(急停/速度读回)不覆盖状态栏
+            if time.monotonic() >= self._status_pinned_until:
+                self.status(base + self._action_suffix() + self._loc_quality_hint)
         except HermesError as e:
             self.status(f"轮询异常: {e}")
         # 健康监控(节流到~2s) + 雷达点云(勾选时)
