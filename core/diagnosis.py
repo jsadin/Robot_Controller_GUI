@@ -30,6 +30,9 @@ class DiagnosisAggregator:
         self.arm = arm
         self.camera = camera
         self.ranging = ranging
+        # 静默连接失败时供诊断展示（chassis 仍为 None）
+        self.chassis_last_error: Optional[str] = None
+        self.boot_notes: List[str] = []
 
     def collect(self) -> List[DeviceStatus]:
         return [
@@ -41,7 +44,21 @@ class DiagnosisAggregator:
 
     def _chassis_status(self) -> DeviceStatus:
         if self.chassis is None:
-            return DeviceStatus(DeviceId.CHASSIS, ConnectionState.DISCONNECTED, "未绑定")
+            if self.chassis_last_error:
+                return DeviceStatus(
+                    DeviceId.CHASSIS,
+                    ConnectionState.ERROR,
+                    self.chassis_last_error,
+                    [
+                        AlarmItem(
+                            DeviceId.CHASSIS,
+                            "BOOT",
+                            self.chassis_last_error,
+                            AlarmLevel.ERROR,
+                        )
+                    ],
+                )
+            return DeviceStatus(DeviceId.CHASSIS, ConnectionState.DISCONNECTED, "未连接")
         try:
             info = self.chassis.get_health_items()
             alarms = []
@@ -98,15 +115,25 @@ class DiagnosisAggregator:
     def _camera_status(self) -> DeviceStatus:
         if self.camera is None:
             return DeviceStatus(DeviceId.CAMERA, ConnectionState.DISCONNECTED, "未绑定")
+        opened = False
+        try:
+            opened = bool(self.camera.is_open())
+        except Exception:
+            opened = False
         frame = None
         try:
             frame = self.camera.read_bgr()
         except Exception as e:
             return DeviceStatus(DeviceId.CAMERA, ConnectionState.ERROR, str(e))
-        if frame is None:
-            return DeviceStatus(DeviceId.CAMERA, ConnectionState.DISCONNECTED, "无画面")
-        h, w = frame.shape[:2]
-        return DeviceStatus(DeviceId.CAMERA, ConnectionState.CONNECTED, f"{w}x{h}")
+        if frame is not None:
+            h, w = frame.shape[:2]
+            return DeviceStatus(DeviceId.CAMERA, ConnectionState.CONNECTED, f"{w}x{h}")
+        if opened:
+            # RTSP 常见：已 open 但首帧尚未到
+            return DeviceStatus(
+                DeviceId.CAMERA, ConnectionState.CONNECTING, "已打开，等待首帧"
+            )
+        return DeviceStatus(DeviceId.CAMERA, ConnectionState.DISCONNECTED, "未打开")
 
     def _ranging_status(self) -> DeviceStatus:
         if self.ranging is None or not self.ranging.enabled:

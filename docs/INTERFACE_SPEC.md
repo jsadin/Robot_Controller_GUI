@@ -62,13 +62,13 @@ AlarmItem = {device, code, message, level}
 - 面板只发 `pyqtSignal`，不直接 `requests` / `elite_cs_sdk`
 - 主窗口持有设备单例
 - 主题：`ui/theme.py`（SLAM 深色）
-- Tab：星标 | 遥控 | 任务(ChassisTask) | 机械臂 | 视觉 | 诊断 | 任务组(Mission)
+- Tab：星标 | 任务组(Mission) | 诊断（遥控/臂/视觉在分屏工作区）
 
-## 5. Mission v1
+## 5. Mission（已合并原 ChassisTask）
 
-有序步骤：`chassis.navigate_poi` | `chassis.wait` | `arm.run_sequence` | `camera.snapshot`
+有序步骤：`navigate_poi`（可停留）| `go_home` | `wait` | `run_sequence` | `snapshot`
 
-串行执行；全局急停打断；SQLite 落库于数据目录。
+串行执行；暂停/恢复；日历定时（单次/每日）；全局急停打断；SQLite 落库于数据目录。旧 `tasks.db` 启动时一次性导入。
 
 ## 6. 禁止
 

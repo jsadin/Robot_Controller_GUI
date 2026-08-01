@@ -17,6 +17,7 @@ class CameraBackend(Protocol):
     def open(self) -> bool: ...
     def close(self) -> None: ...
     def read_bgr(self) -> Optional[np.ndarray]: ...
+    def is_open(self) -> bool: ...
 
 
 def build_hikvision_rtsp_url(
@@ -46,6 +47,9 @@ class MockCameraBackend:
 
     def close(self) -> None:
         self._open = False
+
+    def is_open(self) -> bool:
+        return bool(self._open)
 
     def read_bgr(self) -> Optional[np.ndarray]:
         if not self._open:
@@ -136,6 +140,9 @@ class OpenCvCameraBackend:
         with self._frame_lock:
             self._latest_bgr = None
 
+    def is_open(self) -> bool:
+        return self._cap is not None and self._cap.isOpened()
+
     def read_bgr(self) -> Optional[np.ndarray]:
         with self._frame_lock:
             if self._latest_bgr is None:
@@ -148,6 +155,39 @@ def build_camera(cfg: DevicesConfig) -> CameraBackend:
     if kind == "mock":
         return MockCameraBackend()
     return OpenCvCameraBackend(cfg.camera)
+
+
+def media_day_dir(data_dir, when=None, *, kind: str = "snapshots"):
+    """按日期归档媒体目录：``{data_dir}/{kind}/YYYY-MM-DD/``。
+
+    kind 默认 ``snapshots``（图片）；后续视频可用同一日期目录或 ``kind=\"videos\"``。
+    """
+    from datetime import datetime
+    from pathlib import Path
+
+    base = Path(data_dir)
+    day = when if when is not None else datetime.now()
+    if hasattr(day, "strftime"):
+        day_s = day.strftime("%Y-%m-%d")
+    else:
+        day_s = str(day)
+    folder = (kind or "snapshots").strip() or "snapshots"
+    out = base / folder / day_s
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def snapshot_path(data_dir, filename: str, when=None):
+    """返回当日抓拍目录下的完整文件路径（自动建目录）。"""
+    from pathlib import Path
+
+    name = Path(filename).name
+    return media_day_dir(data_dir, when=when, kind="snapshots") / name
+
+
+def video_day_dir(data_dir, when=None):
+    """按日期归档视频目录：``{data_dir}/videos/YYYY-MM-DD/``（预留）。"""
+    return media_day_dir(data_dir, when=when, kind="videos")
 
 
 def save_snapshot(frame: np.ndarray, path) -> None:

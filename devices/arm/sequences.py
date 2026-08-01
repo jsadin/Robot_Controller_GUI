@@ -8,6 +8,12 @@ from pathlib import Path
 
 FILE_VERSION = 1
 MIN_STEP_DELAY_AFTER_S = 5.0
+DEFAULT_LOOP_COUNT = 5
+MIN_LOOP_COUNT = 1
+MAX_LOOP_COUNT = 9999
+
+# name -> (loop_enabled, loop_count, steps[(pose_name, delay_after_s), ...])
+SequenceEntry = tuple[bool, int, list[tuple[str, float]]]
 
 
 def default_sequences_path(data_dir: Path) -> Path:
@@ -18,7 +24,15 @@ def default_poses_path(data_dir: Path) -> Path:
     return data_dir / "arm_poses.json"
 
 
-def load_sequences(path: Path) -> dict[str, tuple[bool, list[tuple[str, float]]]]:
+def _clamp_loop_count(value: object) -> int:
+    try:
+        n = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_LOOP_COUNT
+    return max(MIN_LOOP_COUNT, min(MAX_LOOP_COUNT, n))
+
+
+def load_sequences(path: Path) -> dict[str, SequenceEntry]:
     if not path.is_file():
         return {}
     try:
@@ -28,7 +42,7 @@ def load_sequences(path: Path) -> dict[str, tuple[bool, list[tuple[str, float]]]
     entries = raw.get("sequences") if isinstance(raw, dict) else None
     if not isinstance(entries, list):
         return {}
-    out: dict[str, tuple[bool, list[tuple[str, float]]]] = {}
+    out: dict[str, SequenceEntry] = {}
     for row in entries:
         if not isinstance(row, dict):
             continue
@@ -49,18 +63,25 @@ def load_sequences(path: Path) -> dict[str, tuple[bool, list[tuple[str, float]]]
                 except (TypeError, ValueError):
                     d = MIN_STEP_DELAY_AFTER_S
                 steps.append((pn.strip(), max(d, MIN_STEP_DELAY_AFTER_S)))
-        out[name.strip()] = (bool(row.get("loop", False)), steps)
+        loop = bool(row.get("loop", False))
+        # 旧文件无 loop_count 时：勾选循环默认 5 次
+        if "loop_count" in row:
+            loop_count = _clamp_loop_count(row.get("loop_count"))
+        else:
+            loop_count = DEFAULT_LOOP_COUNT
+        out[name.strip()] = (loop, loop_count, steps)
     return out
 
 
-def save_sequences(path: Path, sequences: dict[str, tuple[bool, list[tuple[str, float]]]]) -> None:
+def save_sequences(path: Path, sequences: dict[str, SequenceEntry]) -> None:
     rows = []
     for name in sorted(sequences.keys()):
-        loop, steps = sequences[name]
+        loop, loop_count, steps = sequences[name]
         rows.append(
             {
                 "name": name,
                 "loop": bool(loop),
+                "loop_count": _clamp_loop_count(loop_count),
                 "steps": [{"pose_name": p, "delay_after_s": float(d)} for p, d in steps],
             }
         )

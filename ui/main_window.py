@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from datetime import datetime
 
 # 必须在 import PyQt5 之前加载 elite_cs_sdk，否则 Windows 上会与 Qt 发生
@@ -24,7 +25,7 @@ try:
 except ImportError:
     pass
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -51,16 +52,16 @@ from devices.chassis.client import MOVE_MODE_FREE, MOVE_MODE_TRACK_FIRST
 from devices.chassis.stcm import parse_stcm, parse_stcm_file
 from devices.config_loader import DevicesConfig, load_devices_config
 from devices.arm import ArmController
-from devices.camera import build_camera, save_snapshot
+from devices.camera import build_camera, save_snapshot, snapshot_path
 from devices.ranging import build_ranging
 from devices.common import EStopBus
 from core.diagnosis import DiagnosisAggregator
-from core.mission import MissionExecutor, MissionStore
+from core.mission import MissionExecutor, MissionStatus, MissionStore, check_due_missions
+from core.migrate_tasks import migrate_chassis_tasks_to_missions
+from devices.arm.sequences import default_sequences_path, load_sequences
 from ui.map_canvas import MapCanvas
 from ui.poi_panel import PoiPanel
 from ui.control_panel import ControlPanel
-from ui.task_panel import TaskPanel
-from ui.task_dialog import TaskDialog
 from ui.arm_panel import ArmPanel
 from ui.arm_worker import ArmControlWorker
 from ui.vision_panel import VisionPanel
@@ -68,20 +69,32 @@ from ui.diagnosis_panel import DiagnosisPanel
 from ui.mission_panel import MissionPanel
 from ui.action_sequences_dialog import ActionSequencesDialog
 from ui.workspace import MainWorkspace
-from tasks import TaskStore, TaskExecutor, Task, TaskStatus
-from tasks.scheduler import check_due
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, host: str = "", port: int = 1448,
-                 map_file: str = "map/202Lab.stcm",
-                 devices_cfg: DevicesConfig | None = None):
+    # 任务组执行线程 → 主线程（QueuedConnection，勿用跨线程 QTimer.singleShot）
+    missionProgress = pyqtSignal(object)  # dict 快照
+    missionStatusMsg = pyqtSignal(str)
+
+    def __init__(
+        self,
+        host: str = "",
+        port: int = 1448,
+        map_file: str = "map/202Lab.stcm",
+        devices_cfg: DevicesConfig | None = None,
+        *,
+        auto_connect: bool = True,
+    ):
         super().__init__()
         self.setWindowTitle("机器人控制器 — 整合版")
         self.resize(1440, 900)
         self._port = port
+        self._auto_connect = bool(auto_connect)
         self.cfg = devices_cfg or load_devices_config()
         self.cfg.ensure_data_dir()
+
+        self.missionProgress.connect(self._on_mission_progress_snap)
+        self.missionStatusMsg.connect(self.status)
 
         self.client: HermesClient | None = None
         self.arm = ArmController(self.cfg)
@@ -96,7 +109,10 @@ class MainWindow(QMainWindow):
         self.mission_exec = MissionExecutor(
             chassis=None, arm=self.arm, camera=self.camera,
             data_dir=self.cfg.data_dir,
-            on_status=lambda s: self.status(s),
+            on_status=self._emit_mission_status,
+            on_progress=self._emit_mission_progress,
+            arm_goto=self._mission_arm_goto,
+            arm_at_target=self.arm.joint_at_target,
         )
         self.estop_bus.bind(stop_mission=self.mission_exec.abort)
         self.diag = DiagnosisAggregator(
@@ -106,31 +122,27 @@ class MainWindow(QMainWindow):
         self.canvas = MapCanvas()
         self.panel = PoiPanel()
         self.control = ControlPanel()
-        self.task_panel = TaskPanel()
         self.arm_panel = ArmPanel()
         self.vision_panel = VisionPanel()
         self.diagnosis_panel = DiagnosisPanel()
-        self.mission_panel = MissionPanel()
+        self.mission_panel = MissionPanel(
+            get_pois=self._mission_poi_choices,
+            get_sequences=self._mission_sequence_names,
+            get_sequence_poses=self._mission_sequence_poses,
+        )
         self._pois: list = []          # 当前星标缓存 (POI 对象)
         self._goto_name = ""           # 正在前往的星标名(状态栏显示用)
         self._goto_yaw = None          # 到点后需补转的目标朝向(弧度), None=不补转
-
-        # 任务业务层 (纯逻辑, 不碰 Qt)
-        self.store = TaskStore()
-        self.executor = TaskExecutor(
-            self.store,
-            pois_provider=lambda: self._pois,
-            on_change=self.on_task_change,
-        )
         self._last_sched_check = None   # 上次调度检查的分钟, 防同分钟重复
+        self._map_loaded = False
 
         # 顶部工具条
         self.status_light = QLabel("●")
         self.status_light.setToolTip("连接状态")
         self.conn_label = QLabel("未连接")
-        self.ip_edit = QLineEdit(host or "192.168.11.1")
+        self.ip_edit = QLineEdit(host or self.cfg.chassis.host or "192.168.11.1")
         self.ip_edit.setFixedWidth(120)
-        self.port_edit = QLineEdit(str(port))
+        self.port_edit = QLineEdit(str(port if port else self.cfg.chassis.port))
         self.port_edit.setFixedWidth(56)
         self.btn_connect = QPushButton("🔗 连接")
         self.btn_connect.setObjectName("primary")
@@ -152,6 +164,7 @@ class MainWindow(QMainWindow):
         self.btn_max_map.setToolTip("地图铺满主工作区")
         self.chk_follow = QCheckBox("跟随机器人")
         self.chk_laser = QCheckBox("显示雷达")
+        self.chk_laser.setChecked(True)  # 默认启用激光显示
         self.chk_track_first = QCheckBox("轨道优先")
         self.chk_track_first.setToolTip(
             "勾选后导航走虚拟轨道(遇障碍绕开轨迹再回归); "
@@ -215,14 +228,6 @@ class MainWindow(QMainWindow):
         self.control.brakeReleaseRequested.connect(self.on_brake_release)
 
         # 任务接线
-        self.task_panel.newTask.connect(self.on_task_new)
-        self.task_panel.editTask.connect(self.on_task_edit)
-        self.task_panel.deleteTask.connect(self.on_task_delete)
-        self.task_panel.startTask.connect(self.on_task_start)
-        self.task_panel.pauseTask.connect(self.on_task_pause)
-        self.task_panel.resumeTask.connect(self.on_task_resume)
-        self.task_panel.abortTask.connect(self.on_task_abort)
-
         self.arm_panel.connectRequested.connect(self.on_arm_connect)
         self.arm_panel.disconnectRequested.connect(self.on_arm_disconnect)
         self.arm_panel.jointsChanged.connect(self.on_arm_joints)
@@ -236,8 +241,12 @@ class MainWindow(QMainWindow):
         self.vision_panel.snapshotRequested.connect(self.on_camera_snapshot)
         self.diagnosis_panel.btn_refresh.clicked.connect(self.refresh_diagnosis)
         self.mission_panel.runRequested.connect(self.on_mission_run)
+        self.mission_panel.pauseRequested.connect(self.on_mission_pause)
+        self.mission_panel.resumeRequested.connect(self.on_mission_resume)
         self.mission_panel.abortRequested.connect(self.on_mission_abort)
         self.mission_panel.refreshRequested.connect(self.refresh_missions)
+        self.mission_panel.saveRequested.connect(self.on_mission_save)
+        self.mission_panel.deleteRequested.connect(self.on_mission_delete)
 
         bar = QHBoxLayout()
         bar.setSpacing(6)
@@ -282,11 +291,10 @@ class MainWindow(QMainWindow):
         )
 
         self.tabs = QTabWidget()
-        self.tabs.setFixedWidth(240)
+        self.tabs.setFixedWidth(260)
         self.tabs.addTab(self.panel, "星标")
-        self.tabs.addTab(self.task_panel, "任务")
-        self.tabs.addTab(self.diagnosis_panel, "诊断")
         self.tabs.addTab(self.mission_panel, "任务组")
+        self.tabs.addTab(self.diagnosis_panel, "诊断")
 
         body = QHBoxLayout()
         body.addWidget(self.workspace, 1)
@@ -314,20 +322,136 @@ class MainWindow(QMainWindow):
             except OSError:
                 self.status("未找到默认地图, 请手动载入或从底盘拉取")
 
-        # 载入已存任务(离线也显示, 仅按钮置灰)
-        self.refresh_tasks()
+        # 旧巡检任务一次性导入任务组，再刷新列表
+        self._migrated_tasks_n = migrate_chassis_tasks_to_missions(
+            self.cfg.data_dir, self.mission_store
+        )
         self.refresh_missions()
         self.refresh_diagnosis()
+        if self._migrated_tasks_n:
+            self.status(f"已导入 {self._migrated_tasks_n} 条旧巡检任务到任务组")
 
         self.cam_timer = QTimer(self)
         self.cam_timer.setInterval(100)
         self.cam_timer.timeout.connect(self.poll_camera)
 
-        if host:
-            self.on_connect()
+        # 界面起来后静默连接各设备（不弹连接对话框）
+        if self._auto_connect:
+            QTimer.singleShot(0, self.silent_boot_connect)
 
 
     # ---- 整合：机械臂 / 视觉 / 诊断 / Mission ----
+
+    def silent_boot_connect(self) -> None:
+        """启动静默初始化（有序）：底盘 → 拉地图 → 机械臂 → 摄像头 → 诊断。
+
+        摄像头 RTSP 首帧常晚于 open，故诊断会在短延时后复检刷新。
+        """
+        notes: list[str] = []
+        self.diag.chassis_last_error = None
+
+        # 1) 底盘
+        try:
+            self.on_connect()
+            if self.client:
+                notes.append("底盘已连接")
+            else:
+                err = self.diag.chassis_last_error or "失败"
+                notes.append(f"底盘未连接（{err}）")
+        except Exception as e:
+            self.diag.chassis_last_error = str(e)
+            notes.append(f"底盘异常（{e}）")
+
+        # 2) 拉取地图（依赖底盘）
+        if self.client:
+            try:
+                data = self.client.get_map_stcm()
+                self.load_map(parse_stcm(data))
+                notes.append(f"地图已拉取（{len(data)} 字节）")
+            except Exception as e:
+                notes.append(f"地图拉取失败（{e}）")
+        else:
+            notes.append("地图跳过（底盘未连）")
+
+        # 3) 机械臂
+        try:
+            self.on_arm_connect()
+            if self.arm.is_connected():
+                notes.append("机械臂已连接")
+            else:
+                detail = self.arm.last_connect_error() or "失败"
+                notes.append(f"机械臂未连接（{detail}）")
+        except Exception as e:
+            notes.append(f"机械臂异常（{e}）")
+
+        # 4) 摄像头（open 成功即可；首帧异步）
+        try:
+            opened = bool(self.camera.open())
+            if opened:
+                self.cam_timer.start()
+                # 短暂等待首帧，减少诊断误报
+                frame = None
+                for _ in range(15):  # ~1.5s
+                    QApplication.processEvents()
+                    try:
+                        frame = self.camera.read_bgr()
+                    except Exception:
+                        frame = None
+                    if frame is not None:
+                        break
+                    time.sleep(0.1)
+                if frame is not None:
+                    notes.append("摄像头已打开（有画面）")
+                else:
+                    notes.append("摄像头已打开（等待首帧）")
+            else:
+                notes.append("摄像头打开失败")
+        except Exception as e:
+            notes.append(f"摄像头异常（{e}）")
+
+        self.diag.boot_notes = notes
+        self.refresh_diagnosis()
+        idx = self.tabs.indexOf(self.diagnosis_panel)
+        if idx >= 0:
+            self.tabs.setCurrentIndex(idx)
+        self.status("静默初始化：" + "；".join(notes))
+        # 5) 延时复检诊断（RTSP 首帧/臂状态可能滞后）
+        QTimer.singleShot(2500, self._refresh_boot_diagnosis)
+
+    def _refresh_boot_diagnosis(self) -> None:
+        """启动后复检：按实时状态改写启动摘要，修正「有画面却显示未连接」。"""
+        notes: list[str] = []
+        if self.client:
+            notes.append("底盘已连接")
+        else:
+            err = self.diag.chassis_last_error or "未连接"
+            notes.append(f"底盘未连接（{err}）")
+
+        notes.append("地图已载入" if self._map_loaded else "地图未载入")
+
+        if self.arm.is_connected():
+            notes.append("机械臂已连接")
+        else:
+            notes.append("机械臂未连接（" + (self.arm.last_connect_error() or "失败") + "）")
+
+        try:
+            opened = bool(self.camera.is_open())
+        except Exception:
+            opened = False
+        frame = None
+        try:
+            frame = self.camera.read_bgr()
+        except Exception:
+            frame = None
+        if frame is not None:
+            notes.append("摄像头已连接（有画面）")
+        elif opened:
+            notes.append("摄像头已打开（等待首帧）")
+        else:
+            notes.append("摄像头未连接")
+
+        self.diag.boot_notes = notes
+        self.refresh_diagnosis()
 
     def _on_arm_joints_from_worker(self, degs) -> None:
         QTimer.singleShot(0, lambda: self.arm_panel.set_joints_deg(degs))
@@ -352,6 +476,9 @@ class MainWindow(QMainWindow):
         self.refresh_diagnosis()
 
     def on_arm_disconnect(self) -> None:
+        dlg = getattr(self, "_arm_seq_dlg", None)
+        if dlg is not None and dlg.is_runner_active():
+            dlg.force_stop_runner(log_stop=True)
         self.arm_worker.set_streaming(False)
         self.arm_panel.chk_stream.blockSignals(True)
         self.arm_panel.chk_stream.setChecked(False)
@@ -373,14 +500,29 @@ class MainWindow(QMainWindow):
     def on_arm_speed_limit(self, on: bool) -> None:
         self.cfg.arm.speed_limit_enabled = bool(on)
 
+    def _run_arm_pose(self, deg) -> None:
+        """动作组/位姿前往：写入期望角；未开流控时补发几步。"""
+        self.arm_worker.set_desired_deg(deg)
+        if self.arm.is_connected() and not self.arm_worker.is_streaming():
+            self.arm_worker.request_flush(8)
+
     def on_arm_sequences(self) -> None:
-        dlg = ActionSequencesDialog(
-            self.cfg.data_dir,
-            get_current_joints=lambda: self.arm.read_joints_deg() or self.arm_panel.joint_values_deg(),
-            run_pose=lambda deg: self.arm_worker.set_desired_deg(deg),
-            parent=self,
-        )
-        dlg.exec_()
+        # 非模态 + 主窗口持有引用：关闭对话框不会中断已在跑的动作组
+        dlg = getattr(self, "_arm_seq_dlg", None)
+        if dlg is None:
+            dlg = ActionSequencesDialog(
+                self.cfg.data_dir,
+                get_current_joints=lambda: self.arm.read_joints_deg()
+                or self.arm_panel.joint_values_deg(),
+                run_pose=self._run_arm_pose,
+                is_arm_connected=self.arm.is_connected,
+                on_status=self.status,
+                parent=self,
+            )
+            self._arm_seq_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def on_arm_brake_stub(self) -> None:
         ok = self.arm.brake_release()
@@ -393,6 +535,8 @@ class MainWindow(QMainWindow):
         else:
             self.status("摄像头打开失败")
         self.refresh_diagnosis()
+        # 首帧晚到时再刷一次诊断
+        QTimer.singleShot(2000, self.refresh_diagnosis)
 
     def on_camera_close(self) -> None:
         self.cam_timer.stop()
@@ -408,7 +552,7 @@ class MainWindow(QMainWindow):
             return
         from datetime import datetime as _dt
         stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
-        path = self.cfg.data_dir / "snapshots" / ("snap_" + stamp + ".jpg")
+        path = snapshot_path(self.cfg.data_dir, f"snap_{stamp}.jpg")
         try:
             save_snapshot(frame, path)
             self.status("已抓拍 " + str(path))
@@ -419,31 +563,182 @@ class MainWindow(QMainWindow):
         self.vision_panel.show_bgr(self.camera.read_bgr())
 
     def refresh_diagnosis(self) -> None:
+        self.diagnosis_panel.set_boot_notes(getattr(self.diag, "boot_notes", []) or [])
         self.diagnosis_panel.set_statuses(self.diag.collect())
+
+    def _mission_poi_choices(self):
+        out = []
+        for p in getattr(self, "_pois", None) or []:
+            out.append((str(p.poi_id), str(p.name)))
+        return out
+
+    def _mission_sequence_names(self):
+        try:
+            seqs = load_sequences(default_sequences_path(self.cfg.data_dir))
+        except Exception:
+            return []
+        return sorted(seqs.keys())
+
+    def _mission_sequence_poses(self, name: str):
+        """动作组内有序位姿名（用于分步抓拍勾选）。"""
+        try:
+            seqs = load_sequences(default_sequences_path(self.cfg.data_dir))
+        except Exception:
+            return []
+        entry = seqs.get(str(name or "").strip())
+        if not entry:
+            return []
+        _loop, _count, steps = entry
+        return [pn for pn, _d in steps]
 
     def refresh_missions(self) -> None:
         self.mission_panel.set_missions(self.mission_store.list_missions())
 
-    def on_mission_run(self, payload) -> None:
-        if isinstance(payload, tuple) and payload and payload[0] == "__create__":
-            m = payload[1]
-            self.mission_store.save(m)
-            self.refresh_missions()
-            self.status("已创建 Mission: " + m.name)
+    def _emit_mission_status(self, msg: str) -> None:
+        self.missionStatusMsg.emit(str(msg or ""))
+
+    def _emit_mission_progress(self, m) -> None:
+        """后台线程调用：只发快照，由主线程槽刷新 UI。"""
+        try:
+            total = len(m.steps) if m is not None else 0
+            snap = {
+                "id": getattr(m, "id", None),
+                "name": getattr(m, "name", "") or "",
+                "status": getattr(m, "status", "") or "",
+                "cur_idx": int(getattr(m, "cur_idx", 0) or 0),
+                "total": int(total),
+                "reason": getattr(m, "reason", "") or "",
+            }
+        except Exception:
             return
-        m = payload
-        if self.mission_exec.is_running():
-            self.status("已有 Mission 在执行")
+        self.missionProgress.emit(snap)
+
+    def _on_mission_progress_snap(self, snap) -> None:
+        if not isinstance(snap, dict):
             return
+        name = snap.get("name") or ""
+        status = snap.get("status") or ""
+        cur_idx = int(snap.get("cur_idx") or 0)
+        total = int(snap.get("total") or 0)
+        reason = snap.get("reason") or ""
+        step_disp = MissionPanel.display_step_fraction(cur_idx, total, status)
+        if status == MissionStatus.DONE:
+            text = f"进度：{name} [已完成] {step_disp}"
+        elif status == MissionStatus.ABORTED:
+            text = f"进度：{name} [已中断] {step_disp}" + (f" — {reason}" if reason else "")
+        elif status == MissionStatus.PAUSED:
+            text = f"进度：{name} [已暂停] 步骤 {step_disp}" + (f" — {reason}" if reason else "")
+        else:
+            text = f"进度：{name} [{status}] 步骤 {step_disp}" + (f" — {reason}" if reason else "")
+        self.mission_panel.set_progress_text(text)
+        self.refresh_missions()
+
+    def on_mission_save(self, m) -> None:
+        self.mission_store.save(m)
+        self.refresh_missions()
+        self.status("已保存任务组: " + m.name)
+
+    def on_mission_delete(self, mid: int) -> None:
+        self.mission_store.delete(int(mid))
+        self.refresh_missions()
+        self.status(f"已删除任务组 #{mid}")
+
+    def _mission_arm_goto(self, deg6) -> None:
+        """任务组跑动作组：与「动作组」对话框同一条下发路径（经 ArmControlWorker）。"""
+        self.arm_worker.set_desired_deg(deg6)
+        if self.arm.is_connected() and not self.arm_worker.is_streaming():
+            # 未开流控时临时打开，否则只会 flush 几步到不了位
+            self.arm_worker.set_streaming(True)
+            try:
+                self.arm_panel.chk_stream.blockSignals(True)
+                self.arm_panel.chk_stream.setChecked(True)
+                self.arm_panel.chk_stream.blockSignals(False)
+            except Exception:
+                pass
+
+    def _mission_bind_devices(self) -> None:
         self.mission_exec.chassis = self.client
         self.mission_exec.arm = self.arm
         self.mission_exec.camera = self.camera
-        self.mission_exec.start(m, self.mission_store)
-        self.status("开始执行 Mission: " + m.name)
+        self.mission_exec.arm_goto = self._mission_arm_goto
+        self.mission_exec.arm_at_target = self.arm.joint_at_target
+
+    def _mission_reload(self, m):
+        if m is None or m.id is None:
+            return m
+        return self.mission_store.get(int(m.id)) or m
+
+    def on_mission_run(self, payload) -> None:
+        m = self._mission_reload(payload)
+        if self.mission_exec.is_running():
+            self.status("已有任务组在执行")
+            return
+        if not m.steps:
+            self.status("任务组无步骤，请先编辑")
+            return
+        self._mission_bind_devices()
+        try:
+            self.mission_exec.start(m, self.mission_store, resume=False)
+        except RuntimeError as e:
+            self.status(str(e))
+            return
+        self.mission_panel.set_progress_text(f"进度：{m.name} [执行中] 启动…")
+        self.refresh_missions()
+        self.status("开始执行任务组: " + m.name)
+
+    def on_mission_pause(self) -> None:
+        if not self.mission_exec.is_running():
+            self.status("当前没有执行中的任务组")
+            return
+        self.mission_exec.pause()
+        self.status("已请求暂停任务组")
+
+    def on_mission_resume(self, payload) -> None:
+        m = self._mission_reload(payload)
+        if self.mission_exec.is_running():
+            self.status("已有任务组在执行")
+            return
+        if m.status != MissionStatus.PAUSED:
+            self.status("仅「已暂停」的任务组可恢复，其它请点「执行」")
+            return
+        self._mission_bind_devices()
+        try:
+            self.mission_exec.start(m, self.mission_store, resume=True)
+        except RuntimeError as e:
+            self.status(str(e))
+            return
+        self.status("恢复执行任务组: " + m.name)
+        self.refresh_missions()
 
     def on_mission_abort(self) -> None:
         self.mission_exec.abort()
-        self.status("已请求中断 Mission")
+        self.refresh_missions()
+        self.status("已请求中断任务组")
+
+    def _check_mission_schedule(self) -> None:
+        """每分钟检查任务组定时（由 poll 节流）。"""
+        now = datetime.now()
+        minute = now.strftime("%Y-%m-%d %H:%M")
+        if minute == self._last_sched_check:
+            return
+        self._last_sched_check = minute
+        due = check_due_missions(now, self.mission_store.list_missions())
+        for mid in due:
+            m = self.mission_store.get(mid)
+            if m is None:
+                continue
+            if self.mission_exec.is_running():
+                break
+            m.last_run_date = now.strftime("%Y-%m-%d")
+            self.mission_store.save(m)
+            self._mission_bind_devices()
+            try:
+                self.mission_exec.start(m, self.mission_store, resume=False)
+                self.status(f"定时触发任务组「{m.name}」")
+            except RuntimeError as e:
+                self.status(str(e))
+        if due:
+            self.refresh_missions()
 
     def on_workspace_overview(self) -> None:
         self.workspace.restore_overview()
@@ -499,6 +794,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_tracks(stcm.tracks())
         if self._pois:
             self.canvas.set_pois(self._pois)
+        self._map_loaded = True
 
     # ---- 按钮回调 ----
 
@@ -518,7 +814,9 @@ class MainWindow(QMainWindow):
         try:
             port = int(self.port_edit.text())
         except ValueError:
+            self.diag.chassis_last_error = "端口号无效"
             self.status("端口号无效")
+            self.refresh_diagnosis()
             return
         self._port = port
         self.client = HermesClient(host, port)
@@ -534,7 +832,6 @@ class MainWindow(QMainWindow):
             self._set_conn_light(True, f"已连接 {model}" if model else "已连接")
             self.panel.set_online(True)
             self.control.set_online(True)
-            self.task_panel.set_online(True)
             self.btn_wall.setEnabled(True)
             self.btn_wall_mgr.setEnabled(True)
             self.btn_track.setEnabled(True)
@@ -548,14 +845,18 @@ class MainWindow(QMainWindow):
             self.timer.start()
             self.estop_bus.bind(chassis=self.client)
             self.diag.chassis = self.client
+            self.diag.chassis_last_error = None
             self.mission_exec.chassis = self.client
             self.refresh_diagnosis()
         except HermesError as e:
             self.client = None
+            self.diag.chassis = None
+            self.diag.chassis_last_error = str(e)
             self._set_conn_light(False)
             self.panel.set_online(False)
             self.control.set_online(False)
             self.status(f"连接失败: {e}")
+            self.refresh_diagnosis()
 
     def load_speed_settings(self) -> None:
         """连接后填充策略列表与当前速度到遥控面板。"""
@@ -851,11 +1152,9 @@ class MainWindow(QMainWindow):
                 self.control.set_estop_state(False)
                 return
             self.estop_bus.trigger()
-            if self.client:
-                try:
-                    self.executor.abort(self.client)
-                except Exception:
-                    pass
+            dlg = getattr(self, "_arm_seq_dlg", None)
+            if dlg is not None and dlg.is_runner_active():
+                dlg.force_stop_runner(log_stop=True)
             self.control.set_estop_state(True)
             self.status("已触发系统急停")
             return
@@ -1169,108 +1468,6 @@ class MainWindow(QMainWindow):
         except HermesError:
             pass
 
-    # ---- 任务编排 (功能表 #12 #13 #14) ----
-
-    def refresh_tasks(self) -> None:
-        self.task_panel.set_tasks(self.store.list_tasks())
-
-    def on_task_change(self, task) -> None:
-        """执行器状态变化回调: 刷新列表 + 高亮当前航点。"""
-        self.refresh_tasks()
-        tid = self.executor.current_target_poi_id()
-        if tid:
-            self.canvas.highlight_poi(tid)
-        if task.status == TaskStatus.DONE:
-            self.status(f"任务「{task.name}」已完成")
-        elif task.status == TaskStatus.ABORTED:
-            self.status(f"任务「{task.name}」中断: {task.reason}")
-
-    def on_task_new(self) -> None:
-        dlg = TaskDialog(self._pois, parent=self)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        f = dlg.result_fields()
-        if not f["poi_ids"]:
-            self.status("任务至少需要一个航点")
-            return
-        self.store.add(Task(id=None, **f))
-        self.refresh_tasks()
-        self.status(f"已新建任务「{f['name']}」")
-
-    def on_task_edit(self, task_id: int) -> None:
-        task = self.store.get(task_id)
-        if not task:
-            return
-        if task.status == TaskStatus.RUNNING:
-            self.status("任务执行中, 不能编辑")
-            return
-        dlg = TaskDialog(self._pois, task=task, parent=self)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        f = dlg.result_fields()
-        task.name = f["name"]
-        task.poi_ids = f["poi_ids"]
-        task.dwells = f["dwells"]
-        task.schedule_kind = f["schedule_kind"]
-        task.schedule_time = f["schedule_time"]
-        task.cur_idx = 0
-        task.status = TaskStatus.PENDING
-        self.store.update(task)
-        self.refresh_tasks()
-
-    def on_task_delete(self, task_id: int) -> None:
-        task = self.store.get(task_id)
-        if not task:
-            return
-        if QMessageBox.question(
-            self, "删除任务", f"确定删除「{task.name}」?"
-        ) != QMessageBox.Yes:
-            return
-        self.store.delete(task_id)
-        self.refresh_tasks()
-
-    def on_task_start(self, task_id: int) -> None:
-        if not self.client:
-            return
-        task = self.store.get(task_id)
-        if task:
-            self.executor.start(task, self.client)
-
-    def on_task_pause(self) -> None:
-        if self.client:
-            self.executor.pause(self.client)
-
-    def on_task_resume(self, task_id: int) -> None:
-        if not self.client:
-            return
-        task = self.store.get(task_id)
-        if task:
-            self.executor.resume(task, self.client)
-
-    def on_task_abort(self) -> None:
-        if self.client:
-            self.executor.abort(self.client)
-
-    def _check_schedule(self) -> None:
-        """每分钟检查定时任务(由 poll 节流调用)。"""
-        now = datetime.now()
-        minute = now.strftime("%Y-%m-%d %H:%M")
-        if minute == self._last_sched_check:
-            return
-        self._last_sched_check = minute
-        due = check_due(now, self.store.list_tasks())
-        for tid in due:
-            task = self.store.get(tid)
-            if task is None:
-                continue
-            task.last_run_date = now.strftime("%Y-%m-%d")
-            self.store.update(task)
-            # 仅当无任务在跑时启动(严格串行); 否则本次跳过, 下个周期不再触发
-            self.executor.start(task, self.client)
-            self.status(f"定时触发任务「{task.name}」")
-        if due:
-            self.refresh_tasks()
-
     # ---- 定时轮询 (功能表 #2 #15) ----
 
     def poll(self) -> None:
@@ -1292,9 +1489,7 @@ class MainWindow(QMainWindow):
         self._poll_health()
         self._poll_laser()
         self._poll_nav_path()
-        # 任务执行器心跳 + 定时检查(异常已在内部各自吞掉, 不影响轮询)
-        self.executor.tick(self.client)
-        self._check_schedule()
+        self._check_mission_schedule()
 
     def _poll_nav_path(self) -> None:
         """点击导航进行中: 节流刷新剩余路线; 到达/结束则清除。"""
@@ -1389,24 +1584,37 @@ def main():
     cfg.ensure_data_dir()
 
     host, port = cfg.chassis.host, cfg.chassis.port
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
+    offline = False
+    ask = False
+    args = [a for a in sys.argv[1:] if a]
+    for arg in args:
         if arg in ("--offline", "offline"):
+            offline = True
             host = ""
-        elif ":" in arg:
+        elif arg in ("--ask", "ask"):
+            ask = True
+        elif ":" in arg and not arg.startswith("-"):
             host, p = arg.rsplit(":", 1)
             port = int(p) if p.isdigit() else cfg.chassis.port
-        else:
+        elif not arg.startswith("-"):
             host = arg
 
-    if host:
+    # 默认静默连接；仅 --ask 时弹出原连接对话框
+    if ask and host and not offline:
         dlg = ConnectDialog(host=host, port=port)
         if dlg.exec_() == ConnectDialog.Accepted:
             host, port = dlg.host(), dlg.port()
         else:
+            offline = True
             host = ""
 
-    win = MainWindow(host=host, port=port, map_file=_default_map_file(), devices_cfg=cfg)
+    win = MainWindow(
+        host=host,
+        port=port,
+        map_file=_default_map_file(),
+        devices_cfg=cfg,
+        auto_connect=not offline,
+    )
     win.show()
     sys.exit(app.exec_())
 
