@@ -38,6 +38,9 @@ def build_arm_backend(cfg: DevicesConfig) -> _ArmBackend:
             headless_mode=cfg.arm.headless_mode,
             servoj_timeout_ms=cfg.arm.servoj_timeout_ms,
             servoj_time=cfg.arm.servoj_time,
+            skip_rtsi=bool(cfg.arm.skip_rtsi),
+            rtsi_output_recipe=str(cfg.arm.rtsi_output_recipe or ""),
+            rtsi_input_recipe=str(cfg.arm.rtsi_input_recipe or ""),
         )
         return EliteCsRobotBackend(ec)
     raise ValueError(f"unknown arm kind: {cfg.arm.kind!r}")
@@ -89,6 +92,10 @@ class ArmController:
 
     def seed_from_feedback(self) -> None:
         j = self._robot.read_joints_rad()
+        if j is None:
+            baseline = getattr(self._robot, "command_baseline_rad", None)
+            if callable(baseline):
+                j = baseline()
         if j is not None:
             self._joint_planner.reset(cmd=j, desired=j)
 
@@ -109,9 +116,20 @@ class ArmController:
         sample = self._joint_planner.step_toward_desired()
         return self._robot.command_joints_rad(sample, timeout_ms)
 
+    def flush_joint_steps(self, steps: int = 8) -> bool:
+        """离散拖动滑块时连发几步，无需勾选持续流控。"""
+        ok = True
+        for _ in range(max(1, int(steps))):
+            ok = self.advance_joint_command(timeout_ms=None) and ok
+        return ok
+
     def read_joints_deg(self) -> tuple[float, ...] | None:
         j = self._robot.read_joints_rad()
         if j is None:
+            # RTSI 暂不可用时回退到上次指令/连接种子，避免 UI 一直停在 0°
+            last = getattr(self._robot, "last_commanded_deg6", None)
+            if callable(last):
+                return last()
             return None
         return j.as_degrees()
 

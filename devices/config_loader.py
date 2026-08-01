@@ -45,6 +45,9 @@ class ArmCfg:
     headless_mode: bool = True
     servoj_timeout_ms: int = 300
     servoj_time: float = 0.1
+    rtsi_output_recipe: str = ""
+    rtsi_input_recipe: str = ""
+    skip_rtsi: bool = False
 
 
 @dataclass
@@ -163,6 +166,11 @@ def load_devices_config(path: Optional[Path] = None) -> DevicesConfig:
 
     local_ip = (pc.get("local_ip") or "").strip() or "192.168.11.10"
 
+    default_rtsi_out = str(_repo_root() / "config" / "rtsi" / "output_recipe.txt")
+    default_rtsi_in = str(_repo_root() / "config" / "rtsi" / "input_recipe.txt")
+    rtsi_out = str(ar.get("rtsi_output_recipe") or "").strip() or default_rtsi_out
+    rtsi_in = str(ar.get("rtsi_input_recipe") or "").strip() or default_rtsi_in
+
     cfg = DevicesConfig(
         pc_local_ip=local_ip,
         chassis=ChassisCfg(
@@ -178,6 +186,9 @@ def load_devices_config(path: Optional[Path] = None) -> DevicesConfig:
             speed_limit_enabled=bool(ar.get("speed_limit_enabled", True)),
             headless_mode=bool(ar.get("headless_mode", True)),
             servoj_timeout_ms=int(ar.get("servoj_timeout_ms") or 300),
+            rtsi_output_recipe=rtsi_out,
+            rtsi_input_recipe=rtsi_in,
+            skip_rtsi=bool(ar.get("skip_rtsi", False)),
         ),
         camera=CameraCfg(
             kind=str(ca.get("kind") or "hikvision"),

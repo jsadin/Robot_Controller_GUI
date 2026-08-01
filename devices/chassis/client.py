@@ -615,7 +615,16 @@ class HermesClient:
 
     def get_parameter(self, param: str) -> str:
         """读系统参数(返回字符串, 如 '0.700000')。"""
-        return self._get(f"/api/core/system/v1/parameter?param={param}")
+        raw = self._get(f"/api/core/system/v1/parameter?param={param}")
+        if raw is None:
+            return ""
+        # JSON 可能是带引号字符串或裸值
+        if isinstance(raw, (int, float)):
+            return str(raw)
+        s = str(raw).strip()
+        if len(s) >= 2 and s[0] == s[-1] == '"':
+            s = s[1:-1]
+        return s
 
     def set_parameter(self, param: str, value) -> None:
         self._put(

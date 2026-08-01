@@ -67,6 +67,7 @@ from ui.vision_panel import VisionPanel
 from ui.diagnosis_panel import DiagnosisPanel
 from ui.mission_panel import MissionPanel
 from ui.action_sequences_dialog import ActionSequencesDialog
+from ui.workspace import MainWorkspace
 from tasks import TaskStore, TaskExecutor, Task, TaskStatus
 from tasks.scheduler import check_due
 
@@ -77,7 +78,7 @@ class MainWindow(QMainWindow):
                  devices_cfg: DevicesConfig | None = None):
         super().__init__()
         self.setWindowTitle("机器人控制器 — 整合版")
-        self.resize(1200, 760)
+        self.resize(1440, 900)
         self._port = port
         self.cfg = devices_cfg or load_devices_config()
         self.cfg.ensure_data_dir()
@@ -144,6 +145,11 @@ class MainWindow(QMainWindow):
         self.btn_nav = QPushButton("🧭 导航")
         self.btn_health = QPushButton("⚠ 健康")
         self.btn_fit = QPushButton("⛶ 适应窗口")
+        self.btn_overview = QPushButton("总览")
+        self.btn_overview.setObjectName("primary")
+        self.btn_overview.setToolTip("恢复地图+底部分屏总览布局")
+        self.btn_max_map = QPushButton("放大地图")
+        self.btn_max_map.setToolTip("地图铺满主工作区")
         self.chk_follow = QCheckBox("跟随机器人")
         self.chk_laser = QCheckBox("显示雷达")
         self.chk_track_first = QCheckBox("轨道优先")
@@ -161,6 +167,8 @@ class MainWindow(QMainWindow):
         self.btn_reloc.clicked.connect(self.on_reloc_mode)
         self.btn_health.clicked.connect(self.on_show_health)
         self.btn_fit.clicked.connect(self.canvas.fit_view)
+        self.btn_overview.clicked.connect(self.on_workspace_overview)
+        self.btn_max_map.clicked.connect(self.on_workspace_max_map)
         self.chk_follow.toggled.connect(self.canvas.set_follow_robot)
         self.chk_laser.toggled.connect(self.on_laser_toggle)
         self.chk_track_first.toggled.connect(self.on_track_first_toggle)
@@ -246,6 +254,8 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.btn_load)
         bar.addWidget(self.btn_pull)
         bar.addWidget(self.btn_fit)
+        bar.addWidget(self.btn_overview)
+        bar.addWidget(self.btn_max_map)
         bar.addWidget(self._vline())
         # 组3: 标注/动作
         bar.addWidget(self.btn_wall)
@@ -262,19 +272,24 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.chk_laser)
         bar.addWidget(self.chk_follow)
 
-        # 左画布 + 右侧标签页(星标 / 遥控 / 任务)
+        # 主区分屏（地图 + 底盘遥控/机械臂/视觉）+ 右侧精简 Tab
+        self.workspace = MainWorkspace()
+        self.workspace.set_panels(
+            map_widget=self.canvas,
+            chassis=self.control,
+            arm=self.arm_panel,
+            vision=self.vision_panel,
+        )
+
         self.tabs = QTabWidget()
-        self.tabs.setFixedWidth(280)
+        self.tabs.setFixedWidth(240)
         self.tabs.addTab(self.panel, "星标")
-        self.tabs.addTab(self.control, "遥控")
         self.tabs.addTab(self.task_panel, "任务")
-        self.tabs.addTab(self.arm_panel, "机械臂")
-        self.tabs.addTab(self.vision_panel, "视觉")
         self.tabs.addTab(self.diagnosis_panel, "诊断")
         self.tabs.addTab(self.mission_panel, "任务组")
 
         body = QHBoxLayout()
-        body.addWidget(self.canvas, 1)
+        body.addWidget(self.workspace, 1)
         body.addWidget(self.tabs)
 
         root = QVBoxLayout()
@@ -321,11 +336,26 @@ class MainWindow(QMainWindow):
         ok = self.arm.connect()
         detail = self.arm.last_connect_error()
         self.arm_panel.set_connected(ok, detail)
-        self.status("机械臂已连接" if ok else ("机械臂连接失败: " + detail))
+        if ok:
+            # 连接后立刻用 RTSI/种子角同步滑块与规划器，避免从 0° 猛跳超速
+            j = self.arm.read_joints_deg()
+            if j is not None:
+                self.arm_panel.set_joints_deg(list(j))
+                self.arm_worker.set_desired_deg(j)
+            self.arm_worker.set_streaming(True)
+            self.arm_panel.chk_stream.blockSignals(True)
+            self.arm_panel.chk_stream.setChecked(True)
+            self.arm_panel.chk_stream.blockSignals(False)
+            self.status("机械臂已连接（已开流控；关节来自 RTSI/种子）")
+        else:
+            self.status("机械臂连接失败: " + detail)
         self.refresh_diagnosis()
 
     def on_arm_disconnect(self) -> None:
         self.arm_worker.set_streaming(False)
+        self.arm_panel.chk_stream.blockSignals(True)
+        self.arm_panel.chk_stream.setChecked(False)
+        self.arm_panel.chk_stream.blockSignals(False)
         self.arm.disconnect()
         self.arm_panel.set_connected(False)
         self.status("机械臂已断开")
@@ -333,6 +363,9 @@ class MainWindow(QMainWindow):
 
     def on_arm_joints(self, degs: list) -> None:
         self.arm_worker.set_desired_deg(degs)
+        # 未开流控时也连发几步，避免“拖了滑块但臂不动”
+        if self.arm.is_connected() and not self.arm_worker.is_streaming():
+            self.arm_worker.request_flush(8)
 
     def on_arm_speed(self, v: float) -> None:
         self.cfg.arm.max_joint_speed_deg_s = float(v)
@@ -412,8 +445,17 @@ class MainWindow(QMainWindow):
         self.mission_exec.abort()
         self.status("已请求中断 Mission")
 
+    def on_workspace_overview(self) -> None:
+        self.workspace.restore_overview()
+        self.status("已恢复分屏总览")
+
+    def on_workspace_max_map(self) -> None:
+        self.workspace.maximize_map()
+        self.status("地图已放大")
+
     def closeEvent(self, event) -> None:
         try:
+            self.workspace.close_all_floats()
             self.arm_worker.stop()
             self.camera.close()
             self.arm.disconnect()
@@ -743,11 +785,12 @@ class MainWindow(QMainWindow):
     # ---- 遥控 / 调速 (功能表 #5 #6) ----
 
     def on_move_tick(self, direction: int) -> None:
-        """遥控连发: 周期收到方向 -> move_by。出错则停发避免刷屏。"""
+        """遥控连发: 周期收到方向 -> move_by（带 UI 速度比例）。"""
         if not self.client:
             return
         try:
-            self.client.move_by(direction)
+            ratio = self.control.teleop_speed_ratio(direction)
+            self.client.move_by(direction, speed_ratio=ratio)
         except HermesError as e:
             self.control._stop()
             self.status(f"遥控失败: {e}")
@@ -779,18 +822,22 @@ class MainWindow(QMainWindow):
             return
         try:
             self.client.set_max_speed(speed)
-            self.status(f"最大线速度设为 {speed:.2f} m/s")
+            got = self.client.get_max_speed()
+            self.control.set_speeds(got, self.client.get_max_angular_speed())
+            self.status(f"最大线速度已设为 {got:.2f} m/s（读回确认）")
         except HermesError as e:
-            self.status(f"设置失败: {e}")
+            self.status(f"线速度设置失败: {e}")
 
     def on_max_angular(self, speed: float) -> None:
         if not self.client:
             return
         try:
             self.client.set_max_angular_speed(speed)
-            self.status(f"最大角速度设为 {speed:.2f} rad/s")
+            got = self.client.get_max_angular_speed()
+            self.control.set_speeds(self.client.get_max_speed(), got)
+            self.status(f"最大角速度已设为 {got:.2f} rad/s（读回确认）")
         except HermesError as e:
-            self.status(f"设置失败: {e}")
+            self.status(f"角速度设置失败: {e}")
 
     # ---- 安全: 急停 / 刹车释放 ----
 

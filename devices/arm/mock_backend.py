@@ -37,6 +37,12 @@ class MockArmBackend:
             return None
         return self._q
 
+    def command_baseline_rad(self) -> JointState6:
+        return self._q
+
+    def last_commanded_deg6(self) -> tuple[float, float, float, float, float, float]:
+        return self._q.as_degrees()
+
     def command_joints_rad(self, joints: JointState6, timeout_ms: int | None = None) -> bool:
         if not self._connected or self._estop_latch:
             return False

@@ -142,6 +142,32 @@ QScrollBar:vertical {{ background: {BG}; width: 10px; margin: 0; }}
 QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 5px; min-height: 24px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 QLabel {{ background: transparent; }}
+
+/* 分屏 PanelHost */
+QFrame#PanelHost {{
+    background-color: {PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+}}
+QLabel#PanelHostTitle {{
+    color: {TEXT};
+    font-weight: bold;
+    padding-left: 2px;
+}}
+QPushButton#PanelHostBtn {{
+    padding: 2px 8px;
+    font-size: 12px;
+    min-height: 22px;
+}}
+QLabel#PanelHostPlaceholder {{
+    color: {TEXT_DIM};
+    background: {BG};
+}}
+QSplitter::handle {{
+    background: {BORDER};
+}}
+QSplitter::handle:horizontal {{ width: 3px; }}
+QSplitter::handle:vertical {{ height: 3px; }}
 """
 
 

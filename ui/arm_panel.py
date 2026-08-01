@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -29,10 +30,12 @@ class ArmPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setMinimumWidth(180)
         self._sliders = []
         self._updating = False
 
-        root = QVBoxLayout(self)
+        inner = QWidget()
+        root = QVBoxLayout(inner)
         root.setContentsMargins(8, 8, 8, 8)
 
         conn = QHBoxLayout()
@@ -50,10 +53,7 @@ class ArmPanel(QWidget):
         form = QFormLayout(box)
         for i in range(6):
             row = QHBoxLayout()
-            sl = QSlider()
-            sl.setOrientation(1)  # Horizontal
-            from PyQt5.QtCore import Qt
-            sl.setOrientation(Qt.Horizontal)
+            sl = QSlider(Qt.Horizontal)
             sl.setRange(-3600, 3600)  # 0.1 deg
             sl.setValue(0)
             lab = QLabel("0.0")
@@ -89,6 +89,15 @@ class ArmPanel(QWidget):
         acts.addWidget(self.btn_brake)
         root.addLayout(acts)
         root.addStretch(1)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
 
         self.btn_connect.clicked.connect(self.connectRequested.emit)
         self.btn_disconnect.clicked.connect(self.disconnectRequested.emit)

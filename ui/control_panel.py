@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -46,16 +47,26 @@ class ControlPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(236)
+        self.setMinimumWidth(180)
         self._cur_dir = None
 
-        layout = QVBoxLayout(self)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
         layout.addWidget(self._build_teleop())
         layout.addWidget(self._build_speed())
         layout.addWidget(self._build_safety())
         layout.addStretch(1)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
 
         # 连发定时器
         self._timer = QTimer(self)
@@ -128,31 +139,57 @@ class ControlPanel(QWidget):
         v.addWidget(self.cmb_strategy)
 
         # 线速度滑块 0.1~1.2 m/s (×100 取整)
+        # 同时驱动：1) 底盘参数 base.max_moving_speed  2) 遥控 MoveBy speed_ratio
         self.lbl_lin = QLabel("最大线速度: -- m/s")
         v.addWidget(self.lbl_lin)
         self.sld_lin = QSlider(Qt.Horizontal)
         self.sld_lin.setRange(10, 120)
-        self.sld_lin.valueChanged.connect(
-            lambda val: self.lbl_lin.setText(f"最大线速度: {val/100:.2f} m/s")
-        )
-        self.sld_lin.sliderReleased.connect(
-            lambda: self.maxSpeedChanged.emit(self.sld_lin.value() / 100)
-        )
+        self.sld_lin.valueChanged.connect(self._on_lin_changed)
+        self.sld_lin.sliderReleased.connect(self._emit_lin)
         v.addWidget(self.sld_lin)
 
-        # 角速度滑块 0.2~2.0 rad/s
+        # 角速度滑块 0.2~0.8 rad/s（本机 Hermes 实测写入上限约 0.8）
         self.lbl_ang = QLabel("最大角速度: -- rad/s")
         v.addWidget(self.lbl_ang)
         self.sld_ang = QSlider(Qt.Horizontal)
-        self.sld_ang.setRange(20, 200)
-        self.sld_ang.valueChanged.connect(
-            lambda val: self.lbl_ang.setText(f"最大角速度: {val/100:.2f} rad/s")
-        )
-        self.sld_ang.sliderReleased.connect(
-            lambda: self.maxAngularChanged.emit(self.sld_ang.value() / 100)
-        )
+        self.sld_ang.setRange(20, 80)
+        self.sld_ang.valueChanged.connect(self._on_ang_changed)
+        self.sld_ang.sliderReleased.connect(self._emit_ang)
         v.addWidget(self.sld_ang)
+        hint = QLabel("提示: 松开滑块写入底盘参数；遥控时立即按比例生效")
+        hint.setStyleSheet("color: #9aa3b2; font-size: 11px;")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
         return box
+
+    def _on_lin_changed(self, val: int) -> None:
+        self.lbl_lin.setText(f"最大线速度: {val / 100:.2f} m/s")
+        if self._online and not self.sld_lin.isSliderDown():
+            self._emit_lin()
+
+    def _on_ang_changed(self, val: int) -> None:
+        self.lbl_ang.setText(f"最大角速度: {val / 100:.2f} rad/s")
+        if self._online and not self.sld_ang.isSliderDown():
+            self._emit_ang()
+
+    def _emit_lin(self) -> None:
+        self.maxSpeedChanged.emit(self.sld_lin.value() / 100.0)
+
+    def _emit_ang(self) -> None:
+        self.maxAngularChanged.emit(self.sld_ang.value() / 100.0)
+
+    def current_linear_mps(self) -> float:
+        return self.sld_lin.value() / 100.0
+
+    def current_angular_rps(self) -> float:
+        return self.sld_ang.value() / 100.0
+
+    def teleop_speed_ratio(self, direction: int) -> float:
+        """将 UI 速度映射为 MoveByAction 的 speed_ratio (0~1)。"""
+        # 转向用角速度滑块，前后用线速度滑块
+        if direction in (DIR_TURN_LEFT, DIR_TURN_RIGHT):
+            return max(0.05, min(1.0, self.current_angular_rps() / 0.8))
+        return max(0.05, min(1.0, self.current_linear_mps() / 1.2))
 
     def _on_strategy(self, text: str) -> None:
         if text and self._online:
@@ -202,11 +239,11 @@ class ControlPanel(QWidget):
 
     def set_speeds(self, linear: float, angular: float) -> None:
         self.sld_lin.blockSignals(True)
-        self.sld_lin.setValue(int(round(linear * 100)))
+        self.sld_lin.setValue(int(round(max(0.1, min(1.2, linear)) * 100)))
         self.lbl_lin.setText(f"最大线速度: {linear:.2f} m/s")
         self.sld_lin.blockSignals(False)
         self.sld_ang.blockSignals(True)
-        self.sld_ang.setValue(int(round(angular * 100)))
+        self.sld_ang.setValue(int(round(max(0.2, min(0.8, angular)) * 100)))
         self.lbl_ang.setText(f"最大角速度: {angular:.2f} rad/s")
         self.sld_ang.blockSignals(False)
 

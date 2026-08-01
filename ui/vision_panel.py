@@ -20,6 +20,8 @@ class VisionPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setMinimumWidth(180)
+        self._last_bgr = None
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         row = QHBoxLayout()
@@ -39,7 +41,7 @@ class VisionPanel(QWidget):
         root.addLayout(row)
         self.view = QLabel("无画面")
         self.view.setAlignment(Qt.AlignCenter)
-        self.view.setMinimumHeight(200)
+        self.view.setMinimumHeight(80)
         self.view.setStyleSheet("background:#1a1d23; border:1px solid #454c58;")
         root.addWidget(self.view, 1)
         self.btn_open.clicked.connect(self.openRequested.emit)
@@ -48,11 +50,22 @@ class VisionPanel(QWidget):
 
     def show_bgr(self, frame) -> None:
         if frame is None:
+            self._last_bgr = None
             self.view.setText("无画面")
+            self.view.setPixmap(QPixmap())
             return
-        import numpy as np
-        from PyQt5.QtGui import QImage, QPixmap
+        self._last_bgr = frame
+        self._paint_frame()
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._last_bgr is not None:
+            self._paint_frame()
+
+    def _paint_frame(self) -> None:
+        frame = self._last_bgr
+        if frame is None:
+            return
         rgb = frame[:, :, ::-1].copy()
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)

@@ -14,6 +14,7 @@ class ArmControlWorker:
         self.arm = arm
         self._desired: Optional[tuple[float, ...]] = None
         self._streaming = False
+        self._flush_steps = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -35,9 +36,16 @@ class ArmControlWorker:
     def set_streaming(self, on: bool) -> None:
         self._streaming = bool(on)
 
+    def is_streaming(self) -> bool:
+        return self._streaming
+
     def set_desired_deg(self, deg6: Sequence[float]) -> None:
         with self._lock:
             self._desired = tuple(float(x) for x in deg6)
+
+    def request_flush(self, steps: int = 8) -> None:
+        with self._lock:
+            self._flush_steps = max(self._flush_steps, int(steps))
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -45,10 +53,15 @@ class ArmControlWorker:
             try:
                 with self._lock:
                     desired = self._desired
+                    flush = self._flush_steps
+                    self._flush_steps = 0
                 if desired is not None:
                     self.arm.sync_joint_desired_deg(desired)
-                if self._streaming and self.arm.is_connected() and not self.arm.motion_halted:
-                    self.arm.advance_joint_command(timeout_ms=None)
+                if self.arm.is_connected() and not self.arm.motion_halted:
+                    if self._streaming:
+                        self.arm.advance_joint_command(timeout_ms=None)
+                    elif flush > 0:
+                        self.arm.flush_joint_steps(flush)
                 j = self.arm.read_joints_deg()
                 if j is not None and self.on_joints is not None:
                     self.on_joints(tuple(j))
