@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "robot_field_pack",
+  "modules": [
+    "devices",
+    "arm_data",
+    "missions",
+    "chassis_walls",
+    "chassis_tracks"
+  ]
+}

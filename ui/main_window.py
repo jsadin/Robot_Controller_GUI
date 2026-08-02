@@ -96,6 +96,7 @@ from devices.camera import build_camera, save_snapshot, snapshot_path
 from devices.ranging import build_ranging
 from devices.common import EStopBus
 from core import app_log
+from core.config_pack import PackManager, default_pack_dir
 from core.diagnosis import DiagnosisAggregator
 from core.mission import MissionExecutor, MissionStatus, MissionStore, check_due_missions
 from core.migrate_tasks import migrate_chassis_tasks_to_missions
@@ -133,6 +134,14 @@ class MainWindow(QMainWindow):
         self._auto_connect = bool(auto_connect)
         self.cfg = devices_cfg or load_devices_config()
         self.cfg.ensure_data_dir()
+        self.pack = PackManager(
+            pack_dir=default_pack_dir(),
+            data_dir=self.cfg.data_dir,
+        )
+        try:
+            self.pack.ensure_layout(seed_from_home=True)
+        except Exception as e:
+            app_log.log_warn("pack", f"ensure_layout: {e}")
 
         self.missionProgress.connect(self._on_mission_progress_snap)
         self.missionStatusMsg.connect(self.status)
@@ -211,6 +220,14 @@ class MainWindow(QMainWindow):
         self.btn_reloc = QPushButton("⌖ 重定位")
         self.btn_nav = QPushButton("🧭 导航")
         self.btn_health = QPushButton("⚠ 健康")
+        self.btn_export_pack = QPushButton("⇪ 导出配置包")
+        self.btn_export_pack.setToolTip(
+            "导出现场配置包 ZIP（设备配置、动作组、任务组；已连接时含轨道/虚拟墙）"
+        )
+        self.btn_import_pack = QPushButton("⇩ 加载配置包")
+        self.btn_import_pack.setToolTip(
+            "从 ZIP/文件夹加载到 exe 旁 config/，可覆盖本地数据；已连接时同步墙/轨到机器人"
+        )
         self.btn_fit = QPushButton("⛶ 适应窗口")
         self.btn_overview = QPushButton("总览")
         self.btn_overview.setObjectName("primary")
@@ -234,6 +251,8 @@ class MainWindow(QMainWindow):
         self.btn_home.clicked.connect(self.on_go_home)
         self.btn_reloc.clicked.connect(self.on_reloc_mode)
         self.btn_health.clicked.connect(self.on_show_health)
+        self.btn_export_pack.clicked.connect(self.on_export_config_pack)
+        self.btn_import_pack.clicked.connect(self.on_import_config_pack)
         self.btn_fit.clicked.connect(self.canvas.fit_view)
         self.btn_overview.clicked.connect(self.on_workspace_overview)
         self.btn_max_map.clicked.connect(self.on_workspace_max_map)
@@ -332,6 +351,9 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.btn_reloc)
         bar.addWidget(self.btn_nav)
         bar.addWidget(self.btn_health)
+        bar.addWidget(self._vline())
+        bar.addWidget(self.btn_export_pack)
+        bar.addWidget(self.btn_import_pack)
         bar.addStretch(1)
         # 组4: 视图开关
         bar.addWidget(self.chk_track_first)
@@ -713,6 +735,111 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.status(f"导出日志失败: {e}", pin_secs=6.0)
             app_log.log_error("export", str(e))
+
+    def on_export_config_pack(self) -> None:
+        """导出现场配置包 ZIP（可编辑目录 config/ 的快照）。"""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出配置包",
+            f"robot_pack_{stamp}.zip",
+            "配置包 Zip (*.zip)",
+        )
+        if not path:
+            return
+        try:
+            notes: list[str] = []
+            result = self.pack.export_zip(
+                path,
+                client=self.client,
+                log=lambda m: notes.append(m),
+            )
+            detail = "；".join(result.messages[-4:] or notes[-4:] or ["完成"])
+            self.status(f"配置包已导出: {path} — {detail}", pin_secs=8.0)
+            app_log.log_info(
+                "pack",
+                f"export ok={result.ok} modules={result.modules_done} "
+                f"skip={result.modules_skipped} -> {path}",
+            )
+        except Exception as e:
+            self.status(f"导出配置包失败: {e}", pin_secs=6.0)
+            app_log.log_error("pack", str(e))
+
+    def on_import_config_pack(self) -> None:
+        """从 ZIP 或文件夹加载到同目录 config/，并热重载任务/动作；在线则同步墙轨。"""
+        path, filt = QFileDialog.getOpenFileName(
+            self,
+            "加载配置包（ZIP）",
+            "",
+            "配置包 Zip (*.zip);;所有文件 (*.*)",
+        )
+        src_dir = None
+        if not path:
+            src_dir = QFileDialog.getExistingDirectory(
+                self, "或选择配置包文件夹（含 pack.json）"
+            )
+            if not src_dir:
+                return
+        if QMessageBox.question(
+            self,
+            "加载配置包",
+            "将覆盖本机 config/ 中对应模块（任务组、动作组、设备配置等）。\n"
+            "若已连接底盘，将按包内 JSON 重建虚拟墙与轨道。\n\n继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            if path:
+                result = self.pack.import_zip(path, client=self.client)
+            else:
+                result = self.pack.load_from_dir(src_dir, client=self.client)
+            self._after_pack_loaded(result)
+        except Exception as e:
+            self.status(f"加载配置包失败: {e}", pin_secs=6.0)
+            app_log.log_error("pack", str(e))
+
+    def _after_pack_loaded(self, result) -> None:
+        """配置包落地后：重建任务库、刷地图标注；设备 yaml 提示重启。"""
+        try:
+            self.mission_store = MissionStore(self.cfg.data_dir / "missions.db")
+            self.mission_exec.data_dir = self.cfg.data_dir
+            self.refresh_missions()
+        except Exception as e:
+            app_log.log_warn("pack", f"reload missions: {e}")
+        if self.client:
+            try:
+                self._reload_tracks()
+            except Exception:
+                pass
+            try:
+                self._reload_walls()
+            except Exception:
+                pass
+            try:
+                self.refresh_pois()
+            except Exception:
+                pass
+        detail = "；".join((result.messages or [])[-5:])
+        self.status(
+            f"配置包已加载（模块 {','.join(result.modules_done) or '-'}）。"
+            f"设备 IP/臂类型等若有变更请重启程序。{(' ' + detail) if detail else ''}",
+            pin_secs=10.0,
+        )
+        app_log.log_info(
+            "pack",
+            f"import ok={result.ok} done={result.modules_done} "
+            f"skip={result.modules_skipped}",
+        )
+        QMessageBox.information(
+            self,
+            "配置包",
+            "加载完成。\n\n"
+            f"已应用: {', '.join(result.modules_done) or '（无）'}\n"
+            f"跳过: {', '.join(result.modules_skipped) or '（无）'}\n\n"
+            "任务组/动作组已立即生效。\n"
+            "若修改了 devices.local.yaml（IP/臂类型等），请重启程序。",
+        )
 
     def _mission_poi_choices(self):
         out = []
@@ -1899,6 +2026,12 @@ def main():
     app = QApplication(sys.argv)
     apply_theme(app)
 
+    # 先保证 exe 旁 config/ 骨架，再加载（frozen 的 data_dir 指向 config/data）
+    try:
+        PackManager().ensure_layout(seed_from_home=True)
+    except Exception as e:
+        app_log.log_warn("pack", f"ensure_layout at boot: {e}")
+
     cfg = load_devices_config()
     cfg.ensure_data_dir()
     try:
@@ -1913,6 +2046,7 @@ def main():
         app_log.log_info(
             "config",
             f"primary={primary} local={local or '-'} "
+            f"data_dir={cfg.data_dir} pack={default_pack_dir()} "
             f"arm.kind={cfg.arm.kind} arm.host={cfg.arm.host} "
             f"pc.local_ip={cfg.pc_local_ip} rtsi_files_ok={rtsi_ok}",
         )

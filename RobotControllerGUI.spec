@@ -32,6 +32,7 @@ a = Analysis(
     datas=[
         ('config/devices.yaml', 'config'),
         ('config/devices.local.example.yaml', 'config'),
+        ('config/pack.json', 'config'),
         ('config/rtsi', 'config/rtsi'),
         ('docs', 'docs'),
     ] + list(_elite_datas),

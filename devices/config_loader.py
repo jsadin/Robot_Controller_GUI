@@ -33,6 +33,16 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def app_dir() -> Path:
+    """公开：应用根目录（exe 旁或仓库根）。"""
+    return _app_dir()
+
+
+def bundle_root() -> Path:
+    """公开：打包资源根或仓库根。"""
+    return _bundle_root()
+
+
 def _repo_root() -> Path:
     """兼容旧调用：资源查找优先 bundle。"""
     return _bundle_root()
@@ -222,7 +232,13 @@ def load_devices_config(path: Optional[Path] = None) -> DevicesConfig:
     paths = raw.get("paths") or {}
 
     data_dir_s = (paths.get("data_dir") or "").strip()
-    data_dir = Path(data_dir_s) if data_dir_s else default_data_dir()
+    if data_dir_s:
+        data_dir = Path(data_dir_s)
+    elif getattr(sys, "frozen", False):
+        # exe：业务数据落在可编辑配置包 config/data 下
+        data_dir = _app_dir() / "config" / "data"
+    else:
+        data_dir = default_data_dir()
 
     cam_password = (ca.get("password") or "").strip()
     env_pw = (os.environ.get("ROBOT_CAMERA_PASSWORD") or "").strip()
