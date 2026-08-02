@@ -33,7 +33,8 @@ a = Analysis(
     hiddenimports=['devices', 'core', 'tasks', 'ui', 'elite_cs_sdk'] + list(_elite_hiddenimports),
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    # 自定义 rthook 先于 pyi_rth_pyqt5 执行，避免 Qt 抢先加载导致 exe 闪退
+    runtime_hooks=['packaging/rthook_elite_first.py'],
     excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
