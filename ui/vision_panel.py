@@ -17,6 +17,7 @@ class VisionPanel(QWidget):
     openRequested = pyqtSignal()
     closeRequested = pyqtSignal()
     snapshotRequested = pyqtSignal()
+    openFolderRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -29,6 +30,8 @@ class VisionPanel(QWidget):
         self.btn_open.setObjectName("primary")
         self.btn_close = QPushButton("关闭")
         self.btn_snap = QPushButton("抓拍")
+        self.btn_folder = QPushButton("抓拍目录")
+        self.btn_folder.setToolTip("打开抓拍图片保存文件夹")
         self.btn_light = QPushButton("补光(预留)")
         self.btn_focus = QPushButton("焦距(预留)")
         self.btn_light.setEnabled(False)
@@ -36,6 +39,7 @@ class VisionPanel(QWidget):
         row.addWidget(self.btn_open)
         row.addWidget(self.btn_close)
         row.addWidget(self.btn_snap)
+        row.addWidget(self.btn_folder)
         row.addWidget(self.btn_light)
         row.addWidget(self.btn_focus)
         root.addLayout(row)
@@ -47,6 +51,7 @@ class VisionPanel(QWidget):
         self.btn_open.clicked.connect(self.openRequested.emit)
         self.btn_close.clicked.connect(self.closeRequested.emit)
         self.btn_snap.clicked.connect(self.snapshotRequested.emit)
+        self.btn_folder.clicked.connect(self.openFolderRequested.emit)
 
     def show_bgr(self, frame) -> None:
         if frame is None:

@@ -314,6 +314,7 @@ class MainWindow(QMainWindow):
         self.vision_panel.openRequested.connect(self.on_camera_open)
         self.vision_panel.closeRequested.connect(self.on_camera_close)
         self.vision_panel.snapshotRequested.connect(self.on_camera_snapshot)
+        self.vision_panel.openFolderRequested.connect(self.on_open_snapshot_folder)
         self.diagnosis_panel.btn_refresh.clicked.connect(self.refresh_diagnosis)
         self.diagnosis_panel.exportRequested.connect(self.on_export_logs)
         self.mission_panel.runRequested.connect(self.on_mission_run)
@@ -689,9 +690,27 @@ class MainWindow(QMainWindow):
         path = snapshot_path(self.cfg.data_dir, f"snap_{stamp}.jpg")
         try:
             save_snapshot(frame, path)
-            self.status("已抓拍 " + str(path))
+            self.status("已抓拍 " + str(path), pin_secs=6.0)
+            app_log.log_info("snapshot", str(path))
         except Exception as e:
-            self.status("抓拍失败: " + str(e))
+            self.status("抓拍失败: " + str(e), pin_secs=6.0)
+            app_log.log_error("snapshot", str(e))
+
+    def on_open_snapshot_folder(self) -> None:
+        """打开当前 data_dir 下的抓拍根目录（按日分子目录）。"""
+        from pathlib import Path
+        import subprocess
+
+        root = Path(self.cfg.data_dir) / "snapshots"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            # 优先打开今天子目录（若已有）
+            today = root / __import__("datetime").datetime.now().strftime("%Y-%m-%d")
+            target = today if today.is_dir() else root
+            subprocess.Popen(["explorer", str(target)])
+            self.status(f"抓拍目录: {target}", pin_secs=5.0)
+        except Exception as e:
+            self.status(f"打开抓拍目录失败: {e}", pin_secs=5.0)
 
     def poll_camera(self) -> None:
         self.vision_panel.show_bgr(self.camera.read_bgr())

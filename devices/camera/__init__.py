@@ -231,9 +231,15 @@ def video_day_dir(data_dir, when=None):
 
 
 def save_snapshot(frame: np.ndarray, path) -> None:
+    """保存 BGR 图。Windows 上 cv2.imwrite 对非 ASCII 路径会静默失败，故用 imencode+写文件。"""
     import cv2
     from pathlib import Path
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(p), frame)
+    ok, buf = cv2.imencode(".jpg", frame)
+    if not ok:
+        raise OSError(f"encode jpeg failed: {p}")
+    p.write_bytes(buf.tobytes())
+    if not p.is_file() or p.stat().st_size <= 0:
+        raise OSError(f"snapshot not written: {p}")

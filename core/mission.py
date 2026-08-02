@@ -452,7 +452,12 @@ class MissionExecutor:
 
     def _do_snapshot(self, tag: str, *, raise_on_fail: bool = True) -> bool:
         """抓拍落盘。raise_on_fail=False 时失败只记状态、不中断任务组。"""
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(tag))[:80]
+        # 仅 ASCII：Windows+OpenCV 对中文文件名不友好；isalnum() 会放过汉字
+        safe = "".join(
+            c if (("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9") or c in "-_")
+            else "_"
+            for c in str(tag)
+        )[:80].strip("_") or "snap"
         if self.camera is None:
             msg = "抓拍失败：无摄像头"
             self.on_status(msg)
