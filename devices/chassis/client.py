@@ -308,8 +308,25 @@ class HermesClient:
         return LaserScan.from_dict(self._get("/api/core/system/v1/laserscan"))
 
     def get_localization_quality(self) -> int:
-        """定位质量/置信度(0~100), 用于任务前置健康检查。"""
-        return self._get("/api/core/slam/v1/localization/quality")
+        """定位质量/置信度(0~100), 用于任务前置健康检查。
+
+        固件返回格式不统一: 可能是裸数字(int/float)、dict {"quality":85}、
+        或 None(未建图)。此方法统一归一为 int 0~100。
+        """
+        raw = self._get("/api/core/slam/v1/localization/quality")
+        if raw is None:
+            return 0
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        if isinstance(raw, dict):
+            for key in ("quality", "value", "score", "localizationQuality"):
+                if key in raw:
+                    return int(raw[key])
+            # 兜底: 取第一个数值字段
+            for v in raw.values():
+                if isinstance(v, (int, float)):
+                    return int(v)
+        return 0
 
     def set_mapping(self, enable: bool) -> None:
         """开启/暂停建图。"""

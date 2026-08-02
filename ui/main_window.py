@@ -586,6 +586,14 @@ class MainWindow(QMainWindow):
                 self.client.get_max_speed(),
                 self.client.get_max_angular_speed(),
             )
+            # ---- 速度诊断: 打印完整策略 dict, 用于排查速度字段 ----
+            import json as _json
+            print("[speed-diag] raw_strategies:")
+            for s in raw_strategies:
+                print(" ", _json.dumps(s, ensure_ascii=False))
+            print("[speed-diag] current_strategy:", _json.dumps(current, ensure_ascii=False))
+            print(f"[speed-diag] base.max_moving_speed = {self.client.get_max_speed():.4f}")
+            print(f"[speed-diag] base.max_angular_speed = {self.client.get_max_angular_speed():.4f}")
         except HermesError as e:
             self.status(f"读取速度设置失败: {e}")
 
@@ -1109,8 +1117,10 @@ class MainWindow(QMainWindow):
         # 定位质量低提示
         try:
             q = self.client.get_localization_quality()
-            if isinstance(q, int) and q < self.LOC_QUALITY_WARN:
-                self._loc_quality_hint = f"  ⚠定位质量低({q})"
+            if isinstance(q, (int, float)) and q < self.LOC_QUALITY_WARN:
+                self._loc_quality_hint = f"  ⚠定位质量低({int(q)})"
+            elif isinstance(q, (int, float)):
+                self._loc_quality_hint = ""   # 质量正常, 清空提示
             else:
                 self._loc_quality_hint = ""
         except HermesError:
@@ -1170,7 +1180,7 @@ class MainWindow(QMainWindow):
 
         v = QVBoxLayout(dlg)
         qlabel = QLabel(f"定位质量: {quality} / 100")
-        if isinstance(quality, int) and quality < self.LOC_QUALITY_WARN:
+        if isinstance(quality, (int, float)) and quality < self.LOC_QUALITY_WARN:
             qlabel.setStyleSheet("color:#ff9b9b; font-weight:bold;")
         v.addWidget(qlabel)
         v.addWidget(QLabel(f"共 {len(h.get('errors', []))} 条报警"))
