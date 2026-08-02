@@ -10,7 +10,7 @@ chassis:
 arm:
   kind: mock                  # mock | elite_cs
   host: "192.168.11.150"
-  max_joint_speed_deg_s: 45.0
+  max_joint_speed_deg_s: 15.0
   speed_limit_enabled: true
   headless_mode: true
   servoj_timeout_ms: 300

@@ -133,6 +133,7 @@ class MapCanvas(QGraphicsView):
         self._poi_arrow_items: list = []   # 星标朝向箭头
         self._poi_label_items: list = []   # 星标名称文字标签
         self._track_items: list = []       # 已渲染轨道线段
+        self._track_label_items: list = []  # 轨道名称标签（对齐星标）
         # 画轨道(多点折线)模式
         self._track_mode = False
         self._track_pts: list = []         # 已落顶点(场景坐标)
@@ -166,9 +167,8 @@ class MapCanvas(QGraphicsView):
 
     # ---- 载入地图 ----
 
-    def load_grid(self, grid: GridMap) -> None:
-        self._grid = grid
-        self._scene.clear()
+    def _forget_scene_items(self) -> None:
+        """scene 已清空或即将重建时，丢弃全部本地 item 引用（禁止再 removeItem）。"""
         self._map_item = None
         self._robot_item = None
         self._dock_item = None
@@ -178,12 +178,55 @@ class MapCanvas(QGraphicsView):
         self._poi_label_items = []
         self._wall_items = []
         self._track_items = []
+        self._track_label_items = []
+        self._track_preview_items = []
         self._laser_item = None
         self._path_item = None
         self._highlighted = None
+        self._wall_preview = None
+        self._reloc_preview = None
+        self._heading_preview = None
+        self._wall_start = None
+        self._reloc_start = None
+        self._heading_start = None
+        self._track_pts = []
+
+    @staticmethod
+    def _safe_remove_items(scene: QGraphicsScene, items: list) -> None:
+        for it in items:
+            try:
+                if it is not None and it.scene() is scene:
+                    scene.removeItem(it)
+            except RuntimeError:
+                pass
+
+    def _safe_remove_one(self, item) -> None:
+        try:
+            if item is not None and item.scene() is self._scene:
+                self._scene.removeItem(item)
+        except RuntimeError:
+            pass
+
+    def _item_alive(self, item) -> bool:
+        """item 仍挂在本场景上（scene.clear 后 C++ 已销毁则 False）。"""
+        if item is None:
+            return False
+        try:
+            return item.scene() is self._scene
+        except RuntimeError:
+            return False
+
+    def load_grid(self, grid: GridMap) -> None:
+        """替换底图。保证同一时刻场景中只有一张栅格图。"""
+        self._grid = grid
+        # 先丢弃引用再 clear，避免其它路径持有悬空指针
+        self._forget_scene_items()
+        self._scene.clear()
+        self._forget_scene_items()
 
         qimg = grid_to_qimage(grid)
-        self._map_item = QGraphicsPixmapItem(QPixmap.fromImage(qimg))
+        pix = QPixmap.fromImage(qimg)
+        self._map_item = QGraphicsPixmapItem(pix)
         self._map_item.setZValue(0)
         self._scene.addItem(self._map_item)
         self._scene.setSceneRect(QRectF(0, 0, grid.width, grid.height))
@@ -200,7 +243,8 @@ class MapCanvas(QGraphicsView):
         """更新机器人位置与朝向(世界坐标, 米/弧度)。"""
         if self._grid is None:
             return
-        if self._robot_item is None:
+        if not self._item_alive(self._robot_item):
+            self._robot_item = None
             # 一个指向 +x 的三角箭头, 以 0.25m 为尺度(用格数表示)
             s = max(3.0, 0.25 / self._grid.resolution)
             poly = QPolygonF([
@@ -213,13 +257,15 @@ class MapCanvas(QGraphicsView):
             self._robot_item.setZValue(10)
             self._scene.addItem(self._robot_item)
 
-        pt = self.world_to_scene(x, y)
-        self._robot_item.setPos(pt)
-        # 世界 yaw 逆时针为正(y 上); 场景 y 向下, 故旋转取负, 转角度
-        self._robot_item.setRotation(-math.degrees(yaw))
-
-        if self._follow_robot:
-            self.centerOn(pt)
+        try:
+            pt = self.world_to_scene(x, y)
+            self._robot_item.setPos(pt)
+            # 世界 yaw 逆时针为正(y 上); 场景 y 向下, 故旋转取负, 转角度
+            self._robot_item.setRotation(-math.degrees(yaw))
+            if self._follow_robot:
+                self.centerOn(pt)
+        except RuntimeError:
+            self._robot_item = None
 
     def set_follow_robot(self, follow: bool) -> None:
         """机器人视角: 视图始终跟随机器人(功能表 #4)。"""
@@ -230,25 +276,26 @@ class MapCanvas(QGraphicsView):
     def set_dock(self, x: float, y: float) -> None:
         if self._grid is None:
             return
-        if self._dock_item is None:
+        if not self._item_alive(self._dock_item):
+            self._dock_item = None
             r = max(3.0, 0.2 / self._grid.resolution)
             self._dock_item = QGraphicsEllipseItem(-r, -r, 2 * r, 2 * r)
             self._dock_item.setBrush(QBrush(QColor(40, 160, 60)))
             self._dock_item.setPen(QPen(QColor(0, 80, 0), 0))
             self._dock_item.setZValue(5)
             self._scene.addItem(self._dock_item)
-        self._dock_item.setPos(self.world_to_scene(x, y))
+        try:
+            self._dock_item.setPos(self.world_to_scene(x, y))
+        except RuntimeError:
+            self._dock_item = None
 
     # ---- 星标 (功能表 #9) ----
 
     def set_pois(self, pois) -> None:
         """重画所有星标点 + 朝向箭头。pois: 含 .x .y .yaw .poi_id .name。"""
-        for it in self._poi_items:
-            self._scene.removeItem(it)
-        for it in self._poi_arrow_items:
-            self._scene.removeItem(it)
-        for it in self._poi_label_items:
-            self._scene.removeItem(it)
+        self._safe_remove_items(self._scene, self._poi_items)
+        self._safe_remove_items(self._scene, self._poi_arrow_items)
+        self._safe_remove_items(self._scene, self._poi_label_items)
         self._poi_items = []
         self._poi_arrow_items = []
         self._poi_label_items = []
@@ -318,14 +365,20 @@ class MapCanvas(QGraphicsView):
         """高亮选中的星标(描红圈), 传 None 取消。"""
         # 还原上一个
         prev = self._poi_by_id.get(self._highlighted) if self._highlighted else None
-        if prev is not None:
-            prev.setPen(QPen(QColor(20, 50, 120), 0))
-            prev.setBrush(QBrush(QColor(50, 120, 230)))
+        if self._item_alive(prev):
+            try:
+                prev.setPen(QPen(QColor(20, 50, 120), 0))
+                prev.setBrush(QBrush(QColor(50, 120, 230)))
+            except RuntimeError:
+                pass
         self._highlighted = poi_id
         cur = self._poi_by_id.get(poi_id) if poi_id else None
-        if cur is not None:
-            cur.setPen(QPen(QColor(230, 40, 40), 0))
-            cur.setBrush(QBrush(QColor(255, 170, 60)))
+        if self._item_alive(cur):
+            try:
+                cur.setPen(QPen(QColor(230, 40, 40), 0))
+                cur.setBrush(QBrush(QColor(255, 170, 60)))
+            except RuntimeError:
+                pass
 
     # ---- 激光点云 (雷达实时渲染) ----
 
@@ -337,7 +390,8 @@ class MapCanvas(QGraphicsView):
         """
         if self._grid is None:
             return
-        if self._laser_item is None:
+        if not self._item_alive(self._laser_item):
+            self._laser_item = None
             self._laser_item = QGraphicsPathItem()
             # 点用红色, 无描边, 实心
             self._laser_item.setPen(QPen(Qt.NoPen))
@@ -350,11 +404,19 @@ class MapCanvas(QGraphicsView):
         for x, y in world_points:
             pt = self.world_to_scene(x, y)
             path.addRect(pt.x() - r, pt.y() - r, d, d)
-        self._laser_item.setPath(path)
+        try:
+            self._laser_item.setPath(path)
+        except RuntimeError:
+            self._laser_item = None
 
     def clear_laser(self) -> None:
-        if self._laser_item is not None:
-            self._laser_item.setPath(QPainterPath())
+        if self._item_alive(self._laser_item):
+            try:
+                self._laser_item.setPath(QPainterPath())
+            except RuntimeError:
+                self._laser_item = None
+        else:
+            self._laser_item = None
 
     # ---- 放置模式 (功能表 #10 添加星标) ----
 
@@ -372,8 +434,7 @@ class MapCanvas(QGraphicsView):
 
     def set_walls(self, walls) -> None:
         """渲染虚拟墙。walls: [(id, x1, y1, x2, y2), ...] 世界坐标(米)。"""
-        for it in self._wall_items:
-            self._scene.removeItem(it)
+        self._safe_remove_items(self._scene, self._wall_items)
         self._wall_items = []
         if self._grid is None:
             return
@@ -390,36 +451,97 @@ class MapCanvas(QGraphicsView):
             self._wall_items.append(it)
 
     def set_tracks(self, tracks) -> None:
-        """渲染虚拟轨道。tracks: [(id, x1, y1, x2, y2), ...] 世界坐标(米)。
+        """渲染虚拟轨道（兼容旧 STCM 扁平成段列表）。
 
-        绿色虚线, 与墙(红实线)区分。
+        tracks: [(id, x1, y1, x2, y2), ...] 世界坐标(米)。无名称标签。
         """
-        for it in self._track_items:
-            self._scene.removeItem(it)
+        routes = []
+        for tk in tracks or []:
+            if len(tk) < 5:
+                continue
+            _id, x1, y1, x2, y2 = tk[:5]
+            routes.append(
+                {
+                    "route_id": str(_id),
+                    "name": "",
+                    "segments": [(_id, x1, y1, x2, y2)],
+                }
+            )
+        self.set_track_routes(routes)
+
+    def set_track_routes(self, routes) -> None:
+        """按「线路」渲染轨道：同一次绘制的多段共用名称标签。
+
+        routes: [{
+            route_id, name,
+            segments: [(id, x1, y1, x2, y2), ...] 或原始 REST dict
+        }, ...]
+        """
+        self._safe_remove_items(self._scene, self._track_items)
+        self._safe_remove_items(self._scene, self._track_label_items)
         self._track_items = []
+        self._track_label_items = []
         if self._grid is None:
             return
         pen = QPen(QColor(60, 200, 110), 0)
         pen.setCosmetic(True)
-        pen.setWidth(3)            # 加粗, 实机反馈太细
+        pen.setWidth(3)
         pen.setStyle(Qt.DashLine)
-        for tk in tracks:
-            _id, x1, y1, x2, y2 = tk
-            p1 = self.world_to_scene(x1, y1)
-            p2 = self.world_to_scene(x2, y2)
-            it = QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y())
-            it.setPen(pen)
-            it.setZValue(4)
-            self._scene.addItem(it)
-            self._track_items.append(it)
+        for route in routes or []:
+            name = str(route.get("name") or "").strip()
+            rid = str(route.get("route_id") or "")
+            segs_world = []
+            for seg in route.get("segments") or []:
+                if isinstance(seg, dict):
+                    s, e = seg.get("start", {}), seg.get("end", {})
+                    sid = seg.get("id")
+                    x1, y1 = float(s.get("x", 0)), float(s.get("y", 0))
+                    x2, y2 = float(e.get("x", 0)), float(e.get("y", 0))
+                else:
+                    sid, x1, y1, x2, y2 = seg[:5]
+                    x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+                p1 = self.world_to_scene(x1, y1)
+                p2 = self.world_to_scene(x2, y2)
+                it = QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y())
+                it.setPen(pen)
+                it.setZValue(4)
+                it.setData(0, rid or str(sid))
+                self._scene.addItem(it)
+                self._track_items.append(it)
+                segs_world.append((x1, y1, x2, y2))
+            if name and segs_world:
+                self._add_track_label(name, rid, segs_world)
+
+    def _add_track_label(self, name: str, route_id: str, segs_world) -> None:
+        """在线路折线中点旁绘制名称（样式对齐星标标签）。"""
+        # 取各段中点再平均，作为标签锚点
+        mids = []
+        for x1, y1, x2, y2 in segs_world:
+            mids.append(((x1 + x2) * 0.5, (y1 + y2) * 0.5))
+        if not mids:
+            return
+        ax = sum(p[0] for p in mids) / len(mids)
+        ay = sum(p[1] for p in mids) / len(mids)
+        label = QGraphicsSimpleTextItem(name)
+        font = QFont()
+        font.setPointSize(13)
+        font.setBold(True)
+        label.setFont(font)
+        label.setBrush(QBrush(QColor(20, 90, 50)))  # 深绿，与绿轨区分于星标黑字
+        label.setPen(QPen(Qt.NoPen))
+        label.setZValue(7)
+        label.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        label.setPos(self.world_to_scene(ax, ay) + QPointF(6, -14))
+        label.setData(0, route_id)
+        self._scene.addItem(label)
+        self._track_label_items.append(label)
 
     def set_wall_mode(self, on: bool) -> None:
         """开启画墙模式: 在地图上按下拖拽到松开, 画一条虚拟墙。"""
         self._wall_mode = on
         self._wall_start = None
-        if self._wall_preview is not None:
-            self._scene.removeItem(self._wall_preview)
-            self._wall_preview = None
+        self._safe_remove_one(self._wall_preview)
+        self._wall_preview = None
         if on:
             self.setDragMode(QGraphicsView.NoDrag)
             self.viewport().setCursor(Qt.CrossCursor)
@@ -431,9 +553,8 @@ class MapCanvas(QGraphicsView):
         """开启重定位模式: 按下=机器人真实位置, 拖拽=朝向, 松开提交。"""
         self._reloc_mode = on
         self._reloc_start = None
-        if self._reloc_preview is not None:
-            self._scene.removeItem(self._reloc_preview)
-            self._reloc_preview = None
+        self._safe_remove_one(self._reloc_preview)
+        self._reloc_preview = None
         if on:
             self.setDragMode(QGraphicsView.NoDrag)
             self.viewport().setCursor(Qt.CrossCursor)
@@ -446,9 +567,8 @@ class MapCanvas(QGraphicsView):
         self._heading_mode = True
         self._heading_poi = poi_id
         self._heading_start = self.world_to_scene(x, y)
-        if self._heading_preview is not None:
-            self._scene.removeItem(self._heading_preview)
-            self._heading_preview = None
+        self._safe_remove_one(self._heading_preview)
+        self._heading_preview = None
         self.setDragMode(QGraphicsView.NoDrag)
         self.viewport().setCursor(Qt.CrossCursor)
 
@@ -456,9 +576,8 @@ class MapCanvas(QGraphicsView):
         self._heading_mode = False
         self._heading_poi = None
         self._heading_start = None
-        if self._heading_preview is not None:
-            self._scene.removeItem(self._heading_preview)
-            self._heading_preview = None
+        self._safe_remove_one(self._heading_preview)
+        self._heading_preview = None
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.viewport().unsetCursor()
 
@@ -466,8 +585,7 @@ class MapCanvas(QGraphicsView):
         """开启画轨道模式: 左键依次落点连成折线, 右键/双击结束。"""
         self._track_mode = on
         self._track_pts = []
-        for it in self._track_preview_items:
-            self._scene.removeItem(it)
+        self._safe_remove_items(self._scene, self._track_preview_items)
         self._track_preview_items = []
         if on:
             self.setDragMode(QGraphicsView.NoDrag)
@@ -478,8 +596,7 @@ class MapCanvas(QGraphicsView):
 
     def _redraw_track_preview(self, cur: QPointF = None) -> None:
         """重画折线预览(已落点连线 + 到当前鼠标的跟随段)。"""
-        for it in self._track_preview_items:
-            self._scene.removeItem(it)
+        self._safe_remove_items(self._scene, self._track_preview_items)
         self._track_preview_items = []
         pen = QPen(QColor(60, 200, 110), 0)
         pen.setCosmetic(True)
@@ -548,7 +665,8 @@ class MapCanvas(QGraphicsView):
         """渲染规划/剩余路线。world_points: [(x,y),...] 世界坐标。空则清空。"""
         if self._grid is None:
             return
-        if self._path_item is None:
+        if not self._item_alive(self._path_item):
+            self._path_item = None
             pen = QPen(QColor(80, 200, 255), 0)   # 青蓝色实线
             pen.setCosmetic(True)
             pen.setWidth(3)
@@ -564,11 +682,19 @@ class MapCanvas(QGraphicsView):
             for x, y in pts[1:]:
                 p = self.world_to_scene(x, y)
                 path.lineTo(p)
-        self._path_item.setPath(path)
+        try:
+            self._path_item.setPath(path)
+        except RuntimeError:
+            self._path_item = None
 
     def clear_path(self) -> None:
-        if self._path_item is not None:
-            self._path_item.setPath(QPainterPath())
+        if self._item_alive(self._path_item):
+            try:
+                self._path_item.setPath(QPainterPath())
+            except RuntimeError:
+                self._path_item = None
+        else:
+            self._path_item = None
 
     # ---- 交互 ----
 
@@ -693,9 +819,8 @@ class MapCanvas(QGraphicsView):
             end = self.mapToScene(event.pos())
             x1, y1 = self.scene_to_world(self._wall_start)
             x2, y2 = self.scene_to_world(end)
-            if self._wall_preview is not None:
-                self._scene.removeItem(self._wall_preview)
-                self._wall_preview = None
+            self._safe_remove_one(self._wall_preview)
+            self._wall_preview = None
             self._wall_start = None
             self.set_wall_mode(False)
             # 太短的拖拽忽略(误点)
@@ -710,9 +835,8 @@ class MapCanvas(QGraphicsView):
             end = self.mapToScene(event.pos())
             x, y = self.scene_to_world(start)
             ex, ey = self.scene_to_world(end)
-            if self._reloc_preview is not None:
-                self._scene.removeItem(self._reloc_preview)
-                self._reloc_preview = None
+            self._safe_remove_one(self._reloc_preview)
+            self._reloc_preview = None
             self._reloc_start = None
             self.set_reloc_mode(False)
             # 世界系朝向(用世界坐标算, 避免场景 y 翻转出错)

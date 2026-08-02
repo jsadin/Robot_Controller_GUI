@@ -72,7 +72,7 @@ class ArmPanel(QWidget):
         sf = QFormLayout(spd)
         self.spin_speed = QDoubleSpinBox()
         self.spin_speed.setRange(1.0, 180.0)
-        self.spin_speed.setValue(45.0)
+        self.spin_speed.setValue(15.0)
         self.spin_speed.setSuffix(" °/s")
         self.chk_limit = QCheckBox("启用速度限制")
         self.chk_limit.setChecked(True)

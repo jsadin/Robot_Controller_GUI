@@ -25,7 +25,7 @@ try:
 except ImportError:
     pass
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -46,6 +46,41 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+class _BootArmConnectThread(QThread):
+    """启动时在后台连接机械臂，避免阻塞 UI 导致白屏。"""
+
+    finished_ok = pyqtSignal(bool, str)
+
+    def __init__(self, arm, parent=None):
+        super().__init__(parent)
+        self._arm = arm
+
+    def run(self) -> None:
+        try:
+            ok = bool(self._arm.connect())
+            detail = "" if ok else (self._arm.last_connect_error() or "失败")
+            self.finished_ok.emit(ok, detail)
+        except Exception as e:
+            self.finished_ok.emit(False, str(e))
+
+
+class _BootMapFetchThread(QThread):
+    """后台拉取 STCM 地图字节，主线程再 load_map。"""
+
+    finished_ok = pyqtSignal(object, str)  # bytes|None, error
+
+    def __init__(self, client, parent=None):
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        try:
+            data = self._client.get_map_stcm()
+            self.finished_ok.emit(data, "")
+        except Exception as e:
+            self.finished_ok.emit(None, str(e))
 
 from devices.chassis import (
     DIR_TURN_LEFT,
@@ -110,7 +145,11 @@ class MainWindow(QMainWindow):
         self.estop_bus.bind(arm=self.arm, stop_mission=lambda: None)
         self.arm_worker = ArmControlWorker(self.arm)
         self.arm_worker.on_joints = self._on_arm_joints_from_worker
-        self.arm_worker.start()
+        # 静默启动时延后开启控制线程，避免与后台 connect 并发卡死/白屏
+        self._arm_worker_started = False
+        if not self._auto_connect:
+            self.arm_worker.start()
+            self._arm_worker_started = True
         self.mission_store = MissionStore(self.cfg.data_dir / "missions.db")
         self.mission_exec = MissionExecutor(
             chassis=None, arm=self.arm, camera=self.camera,
@@ -133,6 +172,8 @@ class MainWindow(QMainWindow):
         self.panel = PoiPanel()
         self.control = ControlPanel()
         self.arm_panel = ArmPanel()
+        self.arm_panel.spin_speed.setValue(float(self.cfg.arm.max_joint_speed_deg_s))
+        self.arm_panel.chk_limit.setChecked(bool(self.cfg.arm.speed_limit_enabled))
         self.vision_panel = VisionPanel()
         self.diagnosis_panel = DiagnosisPanel()
         self.mission_panel = MissionPanel(
@@ -148,6 +189,7 @@ class MainWindow(QMainWindow):
         self._last_diag_alarm_key = None  # 诊断告警防抖
         self._arm_was_connected_at_estop = False  # 急停前臂是否已连（解除后重连）
         self._map_loaded = False
+        self._map_loading = False  # 载入/拉取地图期间跳过 poll，避免 scene 并发崩溃
 
         # 顶部工具条
         self.status_light = QLabel("●")
@@ -329,8 +371,8 @@ class MainWindow(QMainWindow):
         self.timer.setInterval(200)
         self.timer.timeout.connect(self.poll)
 
-        # 启动时尝试载入本地地图
-        if map_file:
+        # 离线模式才预载本地地图；静默连接会从底盘拉取，避免本地+远端叠成「双地图」
+        if map_file and not self._auto_connect:
             try:
                 self.load_map(parse_stcm_file(map_file))
                 self.status(f"已载入本地地图 {map_file}")
@@ -346,94 +388,145 @@ class MainWindow(QMainWindow):
         if self._migrated_tasks_n:
             self.status(f"已导入 {self._migrated_tasks_n} 条旧巡检任务到任务组")
 
-        # 始终轮询：无底盘时仍刷新诊断（臂/相机）；有底盘时兼位姿/健康
-        self.timer.start()
-
         self.cam_timer = QTimer(self)
         self.cam_timer.setInterval(100)
         self.cam_timer.timeout.connect(self.poll_camera)
 
-        # 界面起来后静默连接各设备（不弹连接对话框）
-        if self._auto_connect:
-            QTimer.singleShot(0, self.silent_boot_connect)
+        # 静默连接须在首帧绘制之后分步执行；同步阻塞会导致白屏/假死
+        self._boot_notes: list[str] = []
+        self._boot_busy = False
+        # 静默连接改由 mark_ui_ready() 在 show/首绘之后触发，避免构造期抢跑白屏
+        if not self._auto_connect:
+            self.timer.start()
 
+    def mark_ui_ready(self) -> None:
+        """主窗口已 show 并完成首绘后调用，再开始静默连接。"""
+        if not self._auto_connect:
+            return
+        if self._boot_busy or self._boot_notes or self.diag.boot_notes:
+            return
+        self.status("界面已就绪，正在连接设备…")
+        QTimer.singleShot(0, self.silent_boot_connect)
 
     # ---- 整合：机械臂 / 视觉 / 诊断 / Mission ----
 
     def silent_boot_connect(self) -> None:
-        """启动静默初始化（有序）：底盘 → 拉地图 → 机械臂 → 摄像头 → 诊断。
+        """启动静默初始化（分步，让出事件循环，避免白屏）。
 
-        摄像头 RTSP 首帧常晚于 open，故诊断会在短延时后复检刷新。
+        顺序：底盘 → 拉地图 → 机械臂 → 摄像头 → 诊断复检。
         """
-        notes: list[str] = []
+        if self._boot_busy:
+            return
+        self._boot_busy = True
+        self._boot_notes = []
         self.diag.chassis_last_error = None
+        self.status("正在连接底盘…")
+        QTimer.singleShot(0, self._boot_step_chassis)
 
-        # 1) 底盘
+    def _boot_step_chassis(self) -> None:
         try:
             self.on_connect()
             if self.client:
-                notes.append("底盘已连接")
+                self._boot_notes.append("底盘已连接")
             else:
                 err = self.diag.chassis_last_error or "失败"
-                notes.append(f"底盘未连接（{err}）")
+                self._boot_notes.append(f"底盘未连接（{err}）")
         except Exception as e:
             self.diag.chassis_last_error = str(e)
-            notes.append(f"底盘异常（{e}）")
+            self._boot_notes.append(f"底盘异常（{e}）")
+        self.status("静默初始化：" + "；".join(self._boot_notes))
+        QTimer.singleShot(0, self._boot_step_map)
 
-        # 2) 拉取地图（依赖底盘）
-        if self.client:
+    def _boot_step_map(self) -> None:
+        if not self.client:
+            self._boot_notes.append("地图跳过（底盘未连）")
+            self.status("静默初始化：" + "；".join(self._boot_notes))
+            QTimer.singleShot(0, self._boot_step_arm)
+            return
+        self.status("正在拉取地图…")
+        th = _BootMapFetchThread(self.client, self)
+        self._boot_map_thread = th
+        th.finished_ok.connect(self._boot_on_map_done)
+        th.start()
+
+    def _boot_on_map_done(self, data, err: str) -> None:
+        if data:
             try:
-                data = self.client.get_map_stcm()
+                # load_map 在线时会内部 _reload_tracks（REST 线路，不叠 STCM 轨）
                 self.load_map(parse_stcm(data))
-                notes.append(f"地图已拉取（{len(data)} 字节）")
+                self._boot_notes.append(f"地图已拉取（{len(data)} 字节）")
             except Exception as e:
-                notes.append(f"地图拉取失败（{e}）")
+                self._boot_notes.append(f"地图解析失败（{e}）")
+                app_log.log_error("boot_map", str(e))
         else:
-            notes.append("地图跳过（底盘未连）")
+            self._boot_notes.append(f"地图拉取失败（{err or '未知'}）")
+        self.status("静默初始化：" + "；".join(self._boot_notes))
+        QTimer.singleShot(0, self._boot_step_arm)
 
-        # 3) 机械臂
-        try:
-            self.on_arm_connect()
-            if self.arm.is_connected():
-                notes.append("机械臂已连接")
-            else:
-                detail = self.arm.last_connect_error() or "失败"
-                notes.append(f"机械臂未连接（{detail}）")
-        except Exception as e:
-            notes.append(f"机械臂异常（{e}）")
+    def _ensure_arm_worker(self) -> None:
+        if not self._arm_worker_started:
+            self.arm_worker.start()
+            self._arm_worker_started = True
 
-        # 4) 摄像头（open 成功即可；首帧异步）
+    def _boot_step_arm(self) -> None:
+        self.status("正在连接机械臂…")
+        th = _BootArmConnectThread(self.arm, self)
+        self._boot_arm_thread = th
+        th.finished_ok.connect(self._boot_on_arm_done)
+        th.start()
+
+    def _boot_on_arm_done(self, ok: bool, detail: str) -> None:
+        self._ensure_arm_worker()
+        if ok:
+            self._boot_notes.append("机械臂已连接")
+            self.arm_panel.set_connected(True, detail)
+            try:
+                j = self.arm.read_joints_deg()
+                if j is not None:
+                    self.arm_panel.set_joints_deg(list(j))
+                    self.arm_worker.set_desired_deg(j)
+            except Exception:
+                pass
+            self.arm_worker.set_streaming(True)
+            self.arm_panel.chk_stream.blockSignals(True)
+            self.arm_panel.chk_stream.setChecked(True)
+            self.arm_panel.chk_stream.blockSignals(False)
+        else:
+            self.arm_panel.set_connected(False, detail)
+            self._boot_notes.append(f"机械臂未连接（{detail or '失败'}）")
+        self.refresh_diagnosis()
+        self.status("静默初始化：" + "；".join(self._boot_notes))
+        QTimer.singleShot(0, self._boot_step_camera)
+
+    def _boot_step_camera(self) -> None:
+        self._ensure_arm_worker()
+        self.status("正在打开摄像头…")
         try:
             opened = bool(self.camera.open())
             if opened:
                 self.cam_timer.start()
-                # 短暂等待首帧，减少诊断误报
-                frame = None
-                for _ in range(15):  # ~1.5s
-                    QApplication.processEvents()
-                    try:
-                        frame = self.camera.read_bgr()
-                    except Exception:
-                        frame = None
-                    if frame is not None:
-                        break
-                    time.sleep(0.1)
-                if frame is not None:
-                    notes.append("摄像头已打开（有画面）")
-                else:
-                    notes.append("摄像头已打开（等待首帧）")
+                # 不阻塞等待首帧；由延时复检诊断刷新
+                self._boot_notes.append("摄像头已打开（等待首帧）")
             else:
-                notes.append("摄像头打开失败")
+                self._boot_notes.append("摄像头打开失败")
         except Exception as e:
-            notes.append(f"摄像头异常（{e}）")
+            self._boot_notes.append(f"摄像头异常（{e}）")
+        QTimer.singleShot(0, self._boot_step_finish)
 
-        self.diag.boot_notes = notes
+    def _boot_step_finish(self) -> None:
+        self._ensure_arm_worker()
+        self.diag.boot_notes = list(self._boot_notes)
         self.refresh_diagnosis()
         idx = self.tabs.indexOf(self.diagnosis_panel)
         if idx >= 0:
             self.tabs.setCurrentIndex(idx)
-        self.status("静默初始化：" + "；".join(notes))
-        # 5) 延时复检诊断（RTSP 首帧/臂状态可能滞后）
+        self.status("静默初始化：" + "；".join(self._boot_notes))
+        # 轮询在启动完成后开启（on_connect 成功时可能已 start，此处兜底）
+        if not self.timer.isActive():
+            self.timer.start()
+        self._boot_busy = False
+        app_log.log_info("boot", "；".join(self._boot_notes))
+        # RTSP 首帧/臂状态可能滞后
         QTimer.singleShot(2500, self._refresh_boot_diagnosis)
 
     def _refresh_boot_diagnosis(self) -> None:
@@ -475,6 +568,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self.arm_panel.set_joints_deg(degs))
 
     def on_arm_connect(self) -> None:
+        self._ensure_arm_worker()
         ok = self.arm.connect()
         detail = self.arm.last_connect_error()
         self.arm_panel.set_connected(ok, detail)
@@ -847,15 +941,23 @@ class MainWindow(QMainWindow):
         if grid is None:
             self.status("地图中无栅格层")
             return
-        self.canvas.load_grid(grid)
-        dock = stcm.home_dock_pose()
-        if dock:
-            self.canvas.set_dock(dock[0], dock[1])
-        self.canvas.set_walls(stcm.walls())
-        self.canvas.set_tracks(stcm.tracks())
-        if self._pois:
-            self.canvas.set_pois(self._pois)
-        self._map_loaded = True
+        self._map_loading = True
+        try:
+            self.canvas.load_grid(grid)
+            dock = stcm.home_dock_pose()
+            if dock:
+                self.canvas.set_dock(dock[0], dock[1])
+            self.canvas.set_walls(stcm.walls())
+            # 在线：轨道以 REST 为准（含线路名）；勿再画 STCM 轨道，否则与 _reload_tracks 重叠
+            if self.client:
+                self._reload_tracks()
+            else:
+                self.canvas.set_tracks(stcm.tracks())
+            if self._pois:
+                self.canvas.set_pois(self._pois)
+            self._map_loaded = True
+        finally:
+            self._map_loading = False
 
     # ---- 按钮回调 ----
 
@@ -902,13 +1004,19 @@ class MainWindow(QMainWindow):
             self.btn_nav.setEnabled(True)
             self.btn_health.setEnabled(True)
             self.refresh_pois()
+            # 启动流程中延后刷轨道，避免与随后 load_map(scene.clear) 交错出问题
+            if not getattr(self, "_boot_busy", False):
+                self._reload_tracks()
             self.load_speed_settings()
-            self.timer.start()
+            # 静默启动过程中先不轮询：雷达/诊断会占满主线程导致白屏
+            if not getattr(self, "_boot_busy", False):
+                self.timer.start()
             self.estop_bus.bind(chassis=self.client)
             self.diag.chassis = self.client
             self.diag.chassis_last_error = None
             self.mission_exec.chassis = self.client
-            self.refresh_diagnosis()
+            if not getattr(self, "_boot_busy", False):
+                self.refresh_diagnosis()
         except HermesError as e:
             self.client = None
             self.diag.chassis = None
@@ -950,12 +1058,23 @@ class MainWindow(QMainWindow):
         if not self.client:
             self.status("请先连接底盘")
             return
+        if self._map_loading or getattr(self, "_boot_busy", False):
+            self.status("地图正在加载，请稍候")
+            return
         try:
             data = self.client.get_map_stcm()
             self.load_map(parse_stcm(data))
+            # 星标不在 STCM 里，拉完地图后重刷，避免旧场景引用
+            try:
+                self.refresh_pois()
+            except Exception:
+                pass
             self.status(f"已从底盘拉取地图 ({len(data)} 字节)")
         except (HermesError, ValueError) as e:
             self.status(f"拉取失败: {e}")
+        except Exception as e:
+            self.status(f"拉取地图异常: {e}")
+            app_log.log_error("pull_map", str(e))
 
     # ---- 星标 (功能表 #9 #10 #11) ----
 
@@ -1105,9 +1224,26 @@ class MainWindow(QMainWindow):
     def on_track_drawn(self, points: list) -> None:
         if not self.client or len(points) < 2:
             return
+        n_seg = len(points) - 1
+        name, ok = QInputDialog.getText(
+            self,
+            "轨道名称",
+            f"本次绘制 {len(points)} 个点 / {n_seg} 段，将作为一条线路保存。\n"
+            f"请输入线路名称:",
+        )
+        if not ok:
+            self.status("已取消添加轨道")
+            return
+        name = (name or "").strip()
+        if not name:
+            self.status("轨道名称不能为空")
+            return
         try:
-            self.client.add_track(points)
-            self.status(f"已添加轨道({len(points)} 点)")
+            info = self.client.add_track(points, name=name)
+            self.status(
+                f"已添加线路「{info.get('name', name)}」"
+                f"（{info.get('segments', n_seg)} 段）"
+            )
             self._reload_tracks()
         except HermesError as e:
             self.status(f"添加轨道失败: {e}")
@@ -1116,62 +1252,80 @@ class MainWindow(QMainWindow):
         if not self.client:
             return
         try:
-            # 用 REST /lines/tracks(实机确认可用), 返回 [{id,start,end}],
-            # 转成 set_tracks 需要的 (id, x1, y1, x2, y2) 元组。
-            segs = []
-            for t in self.client.list_tracks():
-                s, e = t.get("start", {}), t.get("end", {})
-                segs.append((
-                    t.get("id"),
-                    s.get("x", 0.0), s.get("y", 0.0),
-                    e.get("x", 0.0), e.get("y", 0.0),
-                ))
-            self.canvas.set_tracks(segs)
+            # REST 线段按 route_id 聚合成线路，地图画线并标名称
+            raw = self.client.list_tracks()
+            routes = HermesClient.group_tracks_by_route(raw)
+            self.canvas.set_track_routes(routes)
         except HermesError as e:
             self.status(f"刷新轨道失败: {e}")
+        except Exception as e:
+            # 勿让轨道渲染异常阻断连接/启动流程
+            self.status(f"刷新轨道异常: {e}")
+            app_log.log_error("tracks", str(e))
 
     def on_manage_tracks(self) -> None:
-        """管理虚拟轨道: 列出所有轨道线段, 选中删除。"""
+        """管理虚拟轨道: 按线路（一次绘制的多段）列出，删除整条线路。"""
         if not self.client:
             return
         try:
-            tracks = self.client.list_tracks()
+            raw = self.client.list_tracks()
         except HermesError as e:
             self.status(f"读取轨道失败: {e}")
             return
+        routes = HermesClient.group_tracks_by_route(raw)
         dlg = QDialog(self)
         dlg.setWindowTitle("管理虚拟轨道")
-        dlg.resize(360, 320)
+        dlg.resize(420, 360)
         lst = QListWidget()
-        for w in tracks:
-            s, e = w.get("start", {}), w.get("end", {})
+        for r in routes:
+            segs = r.get("segments") or []
+            ids = [s.get("id") for s in segs if isinstance(s, dict)]
             it = QListWidgetItem(
-                f"#{w.get('id')}  "
-                f"({s.get('x', 0):.2f},{s.get('y', 0):.2f})→"
-                f"({e.get('x', 0):.2f},{e.get('y', 0):.2f})"
+                f"{r.get('name') or '未命名'}  "
+                f"（{len(segs)} 段）"
             )
-            it.setData(256, w.get("id"))
+            it.setData(256, ids)
+            it.setData(257, r.get("route_id"))
             lst.addItem(it)
-        btn_del = QPushButton("删除选中")
+        btn_del = QPushButton("删除选中线路")
         btn_close = QPushButton("关闭")
+        lbl = QLabel(f"共 {len(routes)} 条线路（{len(raw)} 段）")
 
         def do_del():
             it = lst.currentItem()
             if it is None:
                 return
-            tid = it.data(256)
+            ids = it.data(256) or []
+            name = it.text().split("（")[0].strip()
+            if QMessageBox.question(
+                dlg,
+                "删除线路",
+                f"确定删除线路「{name}」及其全部 {len(ids)} 段？",
+            ) != QMessageBox.Yes:
+                return
             try:
-                self.client.delete_track(tid)
+                self.client.delete_track_route(list(ids))
                 lst.takeItem(lst.row(it))
+                left = lst.count()
+                # 重读总数
+                try:
+                    n_seg = len(self.client.list_tracks())
+                except HermesError:
+                    n_seg = "?"
+                lbl.setText(f"共 {left} 条线路（{n_seg} 段）")
                 self._reload_tracks()
-                self.status(f"已删除轨道 #{tid}")
+                self.status(f"已删除线路「{name}」")
             except HermesError as e:
                 self.status(f"删除失败: {e}")
 
         btn_del.clicked.connect(do_del)
         btn_close.clicked.connect(dlg.accept)
         v = QVBoxLayout(dlg)
-        v.addWidget(QLabel(f"共 {len(tracks)} 条轨道线段"))
+        v.addWidget(lbl)
+        tip = QLabel("一次绘制的多段折线归为一条线路；删除将移除该线路全部线段。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#9aa3b2;font-size:11px;")
+        v.addWidget(tip)
         v.addWidget(lst, 1)
         row = QHBoxLayout()
         row.addWidget(btn_del)
@@ -1628,6 +1782,8 @@ class MainWindow(QMainWindow):
     # ---- 定时轮询 (功能表 #2 #15) ----
 
     def poll(self) -> None:
+        if getattr(self, "_boot_busy", False) or getattr(self, "_map_loading", False):
+            return
         if not self.client:
             # 无底盘：仍节流刷新诊断（臂/相机断流等）
             self._poll_health()
@@ -1779,6 +1935,11 @@ def main():
         auto_connect=not offline,
     )
     win.show()
+    win.raise_()
+    win.activateWindow()
+    # 先完成首绘，再启动静默连接（避免构造/show 阶段同步连设备导致白屏）
+    app.processEvents()
+    win.mark_ui_ready()
     sys.exit(app.exec_())
 
 

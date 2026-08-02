@@ -405,25 +405,97 @@ class HermesClient:
     # 注: 墙的 REST usage 是 walls(非 virtual_walls), 轨道同理是 tracks。
 
     def list_tracks(self) -> list[dict]:
-        """获取所有虚拟轨道线段。返回对象数组(同墙: id/start/end)。"""
+        """获取所有虚拟轨道线段。返回对象数组(同墙: id/start/end/metadata)。"""
         return self._get("/api/core/artifact/v1/lines/tracks") or []
 
-    def add_track(self, points: list) -> dict:
-        """添加一条多点折线轨道。points: [(x,y), ...] 折线顶点。
+    def add_track(
+        self,
+        points: list,
+        *,
+        name: str = "",
+        route_id: Optional[str] = None,
+    ) -> dict:
+        """添加一条多点折线轨道（一次绘制 = 一条命名线路）。
 
-        折线拆成相邻顶点的多个 {start,end} 段, 一次顶层数组提交
-        (body 与墙同构, 墙实测顶层数组可用)。
+        points: [(x,y), ...] 折线顶点。
+        折线拆成相邻顶点的多个 {start,end} 段一次提交；各段写入相同
+        metadata（display_name / route_id），便于管理与地图标名。
+        实机已确认 tracks 的 metadata 可持久化回读。
         """
+        rid = (route_id or "").strip() or str(uuid.uuid4())
+        disp = (name or "").strip() or "未命名轨道"
+        meta = {
+            "display_name": disp,
+            "route_id": rid,
+            "type": "track",
+        }
         segs = []
         for i in range(len(points) - 1):
             (x1, y1), (x2, y2) = points[i], points[i + 1]
-            segs.append({"start": {"x": x1, "y": y1},
-                         "end": {"x": x2, "y": y2}})
-        return self._post("/api/core/artifact/v1/lines/tracks", json=segs)
+            segs.append(
+                {
+                    "start": {"x": x1, "y": y1},
+                    "end": {"x": x2, "y": y2},
+                    "metadata": dict(meta),
+                }
+            )
+        if not segs:
+            return {"route_id": rid, "name": disp, "segments": 0}
+        self._post("/api/core/artifact/v1/lines/tracks", json=segs)
+        return {"route_id": rid, "name": disp, "segments": len(segs)}
 
     def delete_track(self, track_id) -> None:
         """按 id 删除一条轨道线段。"""
         self._delete(f"/api/core/artifact/v1/lines/tracks/{track_id}")
+
+    def delete_track_route(self, segment_ids: list) -> None:
+        """删除一条线路下的全部线段。"""
+        for tid in segment_ids:
+            if tid is None:
+                continue
+            self.delete_track(tid)
+
+    @staticmethod
+    def group_tracks_by_route(tracks: list[dict]) -> list[dict]:
+        """将线段列表按 route_id / 名称聚合成线路。
+
+        返回 [{route_id, name, segments: [raw_seg, ...]}, ...]，
+        无 metadata 的旧线段各自成组（名称为「线段 #id」）。
+        """
+        groups: dict[str, dict] = {}
+        order: list[str] = []
+        for t in tracks or []:
+            if not isinstance(t, dict):
+                continue
+            meta = t.get("metadata") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            rid = str(meta.get("route_id") or "").strip()
+            name = str(
+                meta.get("display_name") or meta.get("name") or ""
+            ).strip()
+            tid = t.get("id")
+            if not rid:
+                # 旧数据无 route_id：每段独立成「线路」
+                rid = f"seg:{tid}"
+                if not name:
+                    name = f"线段 #{tid}"
+            if rid not in groups:
+                groups[rid] = {
+                    "route_id": rid,
+                    "name": name or f"轨道 {rid[:8]}",
+                    "segments": [],
+                }
+                order.append(rid)
+            else:
+                # 同组内若后续段有名且当前为空，补名
+                if name and (
+                    not groups[rid]["name"]
+                    or str(groups[rid]["name"]).startswith("轨道 ")
+                ):
+                    groups[rid]["name"] = name
+            groups[rid]["segments"].append(t)
+        return [groups[k] for k in order]
 
     def add_forbidden_area(
         self, x: float, y: float, w: float, h: float

@@ -40,7 +40,7 @@ class ArmCfg:
     kind: str = "mock"
     host: str = "192.168.11.150"
     local_ip: str = ""
-    max_joint_speed_deg_s: float = 45.0
+    max_joint_speed_deg_s: float = 15.0
     speed_limit_enabled: bool = True
     headless_mode: bool = True
     servoj_timeout_ms: int = 300
@@ -182,7 +182,7 @@ def load_devices_config(path: Optional[Path] = None) -> DevicesConfig:
             kind=str(ar.get("kind") or "mock"),
             host=str(ar.get("host") or "192.168.11.150"),
             local_ip=local_ip,
-            max_joint_speed_deg_s=float(ar.get("max_joint_speed_deg_s") or 45.0),
+            max_joint_speed_deg_s=float(ar.get("max_joint_speed_deg_s") or 15.0),
             speed_limit_enabled=bool(ar.get("speed_limit_enabled", True)),
             headless_mode=bool(ar.get("headless_mode", True)),
             servoj_timeout_ms=int(ar.get("servoj_timeout_ms") or 300),
