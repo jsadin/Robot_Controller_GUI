@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -13,15 +14,79 @@ except ImportError:  # pragma: no cover
     yaml = None  # type: ignore
 
 
-def _repo_root() -> Path:
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False)) or hasattr(sys, "_MEIPASS")
+
+
+def _bundle_root() -> Path:
+    """打包资源根（onefile 解压目录）或源码仓库根。"""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass)
     return Path(__file__).resolve().parents[1]
+
+
+def _app_dir() -> Path:
+    """可写/旁路配置目录：exe 所在目录，或源码仓库根。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+def _repo_root() -> Path:
+    """兼容旧调用：资源查找优先 bundle。"""
+    return _bundle_root()
 
 
 def default_config_path() -> Path:
     env = (os.environ.get("ROBOT_CONFIG") or "").strip()
     if env:
         return Path(env)
-    return _repo_root() / "config" / "devices.yaml"
+    # 现场：优先 exe 旁外部配置，便于改 IP / elite_cs，无需重打包
+    for candidate in (
+        _app_dir() / "config" / "devices.yaml",
+        _app_dir() / "devices.yaml",
+    ):
+        if candidate.is_file():
+            return candidate
+    return _bundle_root() / "config" / "devices.yaml"
+
+
+def _find_local_overlay(primary: Path) -> Optional[Path]:
+    """查找 devices.local.yaml（主配置旁 → exe/config → exe 根）。"""
+    candidates = [
+        primary.with_name("devices.local.yaml"),
+        _app_dir() / "config" / "devices.local.yaml",
+        _app_dir() / "devices.local.yaml",
+    ]
+    seen: set[Path] = set()
+    for c in candidates:
+        try:
+            key = c.resolve()
+        except OSError:
+            key = c
+        if key in seen:
+            continue
+        seen.add(key)
+        if c.is_file():
+            return c
+    return None
+
+
+def _resolve_rtsi_path(configured: str, filename: str) -> str:
+    """解析 RTSI 配方路径；配置为空或文件不存在时回退到打包内置。"""
+    configured = (configured or "").strip()
+    if configured and Path(configured).is_file():
+        return configured
+    for candidate in (
+        _bundle_root() / "config" / "rtsi" / filename,
+        _app_dir() / "config" / "rtsi" / filename,
+        _app_dir() / "rtsi" / filename,
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    # 仍返回默认路径，便于日志定位缺失文件
+    return configured or str(_bundle_root() / "config" / "rtsi" / filename)
 
 
 def default_data_dir() -> Path:
@@ -145,8 +210,8 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 def load_devices_config(path: Optional[Path] = None) -> DevicesConfig:
     primary = path or default_config_path()
     raw = _load_yaml(primary)
-    local = primary.with_name("devices.local.yaml")
-    if local.is_file():
+    local = _find_local_overlay(primary)
+    if local is not None:
         raw = _deep_merge(raw, _load_yaml(local))
 
     pc = raw.get("pc") or {}
@@ -166,10 +231,12 @@ def load_devices_config(path: Optional[Path] = None) -> DevicesConfig:
 
     local_ip = (pc.get("local_ip") or "").strip() or "192.168.11.10"
 
-    default_rtsi_out = str(_repo_root() / "config" / "rtsi" / "output_recipe.txt")
-    default_rtsi_in = str(_repo_root() / "config" / "rtsi" / "input_recipe.txt")
-    rtsi_out = str(ar.get("rtsi_output_recipe") or "").strip() or default_rtsi_out
-    rtsi_in = str(ar.get("rtsi_input_recipe") or "").strip() or default_rtsi_in
+    rtsi_out = _resolve_rtsi_path(
+        str(ar.get("rtsi_output_recipe") or ""), "output_recipe.txt"
+    )
+    rtsi_in = _resolve_rtsi_path(
+        str(ar.get("rtsi_input_recipe") or ""), "input_recipe.txt"
+    )
 
     cfg = DevicesConfig(
         pc_local_ip=local_ip,

@@ -29,7 +29,12 @@ a = Analysis(
     ['ui/main_window.py'],
     pathex=['.'],
     binaries=_elite_binaries,
-    datas=[('config/devices.yaml', 'config'), ('docs', 'docs')] + list(_elite_datas),
+    datas=[
+        ('config/devices.yaml', 'config'),
+        ('config/devices.local.example.yaml', 'config'),
+        ('config/rtsi', 'config/rtsi'),
+        ('docs', 'docs'),
+    ] + list(_elite_datas),
     hiddenimports=['devices', 'core', 'tasks', 'ui', 'elite_cs_sdk'] + list(_elite_hiddenimports),
     hookspath=[],
     hooksconfig={},

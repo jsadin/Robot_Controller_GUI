@@ -1,0 +1,14 @@
+# 复制为 devices.local.yaml 放到 exe 同目录的 config\ 下（或 exe 同目录），
+# 勿提交含密码的文件。现场按实际 IP 修改。
+pc:
+  local_ip: "192.168.11.105"   # 本机在机器人网段的 IP（臂 reverse 回连）
+
+arm:
+  kind: elite_cs               # mock | elite_cs
+  host: "192.168.11.150"
+
+camera:
+  kind: hikvision
+  host: "192.168.11.101"
+  user: "admin"
+  # password: ""              # 或设环境变量 ROBOT_CAMERA_PASSWORD

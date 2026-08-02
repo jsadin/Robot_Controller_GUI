@@ -1901,6 +1901,23 @@ def main():
 
     cfg = load_devices_config()
     cfg.ensure_data_dir()
+    try:
+        from pathlib import Path as _Path
+        from devices.config_loader import default_config_path, _find_local_overlay
+        primary = default_config_path()
+        local = _find_local_overlay(primary)
+        rtsi_ok = all(
+            _Path(p).is_file()
+            for p in (cfg.arm.rtsi_output_recipe, cfg.arm.rtsi_input_recipe)
+        )
+        app_log.log_info(
+            "config",
+            f"primary={primary} local={local or '-'} "
+            f"arm.kind={cfg.arm.kind} arm.host={cfg.arm.host} "
+            f"pc.local_ip={cfg.pc_local_ip} rtsi_files_ok={rtsi_ok}",
+        )
+    except Exception as e:
+        app_log.log_warn("config", f"config summary failed: {e}")
 
     host, port = cfg.chassis.host, cfg.chassis.port
     offline = False
