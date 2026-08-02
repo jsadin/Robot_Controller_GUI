@@ -47,7 +47,12 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from devices.chassis import HermesClient, HermesError
+from devices.chassis import (
+    DIR_TURN_LEFT,
+    DIR_TURN_RIGHT,
+    HermesClient,
+    HermesError,
+)
 from devices.chassis.client import MOVE_MODE_FREE, MOVE_MODE_TRACK_FIRST
 from devices.chassis.stcm import parse_stcm, parse_stcm_file
 from devices.config_loader import DevicesConfig, load_devices_config
@@ -55,6 +60,7 @@ from devices.arm import ArmController
 from devices.camera import build_camera, save_snapshot, snapshot_path
 from devices.ranging import build_ranging
 from devices.common import EStopBus
+from core import app_log
 from core.diagnosis import DiagnosisAggregator
 from core.mission import MissionExecutor, MissionStatus, MissionStore, check_due_missions
 from core.migrate_tasks import migrate_chassis_tasks_to_missions
@@ -116,7 +122,11 @@ class MainWindow(QMainWindow):
         )
         self.estop_bus.bind(stop_mission=self.mission_exec.abort)
         self.diag = DiagnosisAggregator(
-            chassis=None, arm=self.arm, camera=self.camera, ranging=self.ranging
+            chassis=None,
+            arm=self.arm,
+            camera=self.camera,
+            ranging=self.ranging,
+            get_arm_streaming=lambda: self.arm_worker.is_streaming(),
         )
 
         self.canvas = MapCanvas()
@@ -134,6 +144,9 @@ class MainWindow(QMainWindow):
         self._goto_name = ""           # 正在前往的星标名(状态栏显示用)
         self._goto_yaw = None          # 到点后需补转的目标朝向(弧度), None=不补转
         self._last_sched_check = None   # 上次调度检查的分钟, 防同分钟重复
+        self._status_pinned_until = 0.0  # 重要状态消息的固定截止时间(monotonic)
+        self._last_diag_alarm_key = None  # 诊断告警防抖
+        self._arm_was_connected_at_estop = False  # 急停前臂是否已连（解除后重连）
         self._map_loaded = False
 
         # 顶部工具条
@@ -193,6 +206,7 @@ class MainWindow(QMainWindow):
         self.canvas.poiHeadingChanged.connect(self.apply_poi_yaw_rad)
         self.btn_nav.clicked.connect(self.on_nav_mode)
         self.canvas.navRequested.connect(self.on_nav_target)
+        self.canvas.modeCancelled.connect(self._on_map_mode_cancelled)
         self.btn_wall.setEnabled(False)
         self.btn_wall_mgr.setEnabled(False)
         self.btn_track.setEnabled(False)
@@ -240,6 +254,7 @@ class MainWindow(QMainWindow):
         self.vision_panel.closeRequested.connect(self.on_camera_close)
         self.vision_panel.snapshotRequested.connect(self.on_camera_snapshot)
         self.diagnosis_panel.btn_refresh.clicked.connect(self.refresh_diagnosis)
+        self.diagnosis_panel.exportRequested.connect(self.on_export_logs)
         self.mission_panel.runRequested.connect(self.on_mission_run)
         self.mission_panel.pauseRequested.connect(self.on_mission_pause)
         self.mission_panel.resumeRequested.connect(self.on_mission_resume)
@@ -330,6 +345,9 @@ class MainWindow(QMainWindow):
         self.refresh_diagnosis()
         if self._migrated_tasks_n:
             self.status(f"已导入 {self._migrated_tasks_n} 条旧巡检任务到任务组")
+
+        # 始终轮询：无底盘时仍刷新诊断（臂/相机）；有底盘时兼位姿/健康
+        self.timer.start()
 
         self.cam_timer = QTimer(self)
         self.cam_timer.setInterval(100)
@@ -564,7 +582,43 @@ class MainWindow(QMainWindow):
 
     def refresh_diagnosis(self) -> None:
         self.diagnosis_panel.set_boot_notes(getattr(self.diag, "boot_notes", []) or [])
-        self.diagnosis_panel.set_statuses(self.diag.collect())
+        statuses, summary = self.diag.collect_with_summary()
+        self.diagnosis_panel.set_statuses(statuses, summary)
+        alarm_key = frozenset(
+            (a.device.value, a.code, a.level.value)
+            for s in statuses
+            for a in (s.alarms or [])
+        )
+        if alarm_key != self._last_diag_alarm_key:
+            prev = self._last_diag_alarm_key
+            self._last_diag_alarm_key = alarm_key
+            if prev is not None or alarm_key:
+                if alarm_key:
+                    app_log.log_warn(
+                        "diagnosis",
+                        f"告警变化 overall={summary.overall.value} "
+                        f"faults={summary.fault_count} warns={summary.warn_count} "
+                        f"codes={sorted(c for _, c, _ in alarm_key)}",
+                    )
+                else:
+                    app_log.log_info("diagnosis", "告警已清除")
+
+    def on_export_logs(self) -> None:
+        """打包 app.log / crash.log / 诊断快照 / 状态环形缓冲。"""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"robot_logs_{stamp}.zip"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出日志", default_name, "Zip (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            out = app_log.export_bundle(path, self.diag.collect_snapshot())
+            self.status(f"日志已导出: {out}", pin_secs=6.0)
+            app_log.log_info("export", f"logs exported to {out}")
+        except Exception as e:
+            self.status(f"导出日志失败: {e}", pin_secs=6.0)
+            app_log.log_error("export", str(e))
 
     def _mission_poi_choices(self):
         out = []
@@ -760,8 +814,15 @@ class MainWindow(QMainWindow):
 
     # ---- 通用 ----
 
-    def status(self, msg: str) -> None:
-        self.statusBar().showMessage(msg)
+    def status(self, msg: str, pin_secs: float = 0.0) -> None:
+        """在状态栏显示消息。pin_secs>0 时固定该消息若干秒, poll 不覆盖。"""
+        text = str(msg or "")
+        self.statusBar().showMessage(text)
+        if pin_secs > 0:
+            self._status_pinned_until = time.monotonic() + pin_secs
+        # 位姿/轮询刷屏不写日志；其余状态栏文案进环形缓冲
+        if text and not text.startswith("位姿 (") and not text.startswith("轮询异常"):
+            app_log.log_info("status", text)
 
     def _vline(self) -> QFrame:
         """工具栏分组竖分隔线。"""
@@ -863,9 +924,21 @@ class MainWindow(QMainWindow):
         if not self.client:
             return
         try:
-            strategies = self.client.get_strategies()
+            raw_strategies = self.client.get_strategies()
+            # 策略列表可能是 list[dict] 或 list[str]，统一提取 id 字段
+            strategy_ids = []
+            for s in raw_strategies:
+                if isinstance(s, dict):
+                    strategy_ids.append(s.get("id") or s.get("name") or str(s))
+                else:
+                    strategy_ids.append(str(s))
             current = self.client.get_current_strategy()
-            self.control.set_strategies(strategies, str(current))
+            # current 可能是 dict 或 str，提取 id
+            if isinstance(current, dict):
+                current_id = current.get("id") or current.get("name") or ""
+            else:
+                current_id = str(current)
+            self.control.set_strategies(strategy_ids, current_id)
             self.control.set_speeds(
                 self.client.get_max_speed(),
                 self.client.get_max_angular_speed(),
@@ -898,11 +971,30 @@ class MainWindow(QMainWindow):
         except HermesError as e:
             self.status(f"读取星标失败: {e}")
 
+    def _enter_map_mode(self, enable_fn, hint: str) -> None:
+        """进入地图交互模式：先清其它模式，聚焦画布以便 Esc 退出。"""
+        self.canvas.cancel_active_modes()
+        enable_fn()
+        self.canvas.setFocus(Qt.OtherFocusReason)
+        self.status(hint)
+
+    def _on_map_mode_cancelled(self) -> None:
+        self.status("已退出地图操作模式（Esc）")
+
+    def keyPressEvent(self, event) -> None:
+        # 焦点不在画布时也能 Esc 退出地图模式
+        if event.key() == Qt.Key_Escape and self.canvas.cancel_active_modes():
+            self._on_map_mode_cancelled()
+            return
+        super().keyPressEvent(event)
+
     def on_add_mode(self) -> None:
         if not self.client:
             return
-        self.canvas.set_place_mode(True)
-        self.status("请在地图上点击要放置星标的位置")
+        self._enter_map_mode(
+            lambda: self.canvas.set_place_mode(True),
+            "放置星标: 点击地图选点，Esc 退出",
+        )
 
     def on_place(self, x: float, y: float) -> None:
         """地图点击放置回调: 输名 -> add_poi -> 刷新。"""
@@ -968,8 +1060,10 @@ class MainWindow(QMainWindow):
         poi = self._find_poi(poi_id)
         if not poi or not self.client:
             return
-        self.canvas.set_poi_heading_mode(poi_id, poi.x, poi.y)
-        self.status("在地图上从该星标拖拽指向朝向, 松开提交")
+        self._enter_map_mode(
+            lambda: self.canvas.set_poi_heading_mode(poi_id, poi.x, poi.y),
+            "拖拽星标朝向: 从星标拖出方向后松开；Esc 退出",
+        )
 
     def on_heading_value(self, poi_id: str, deg: float) -> None:
         """数值方式设朝向(度)。"""
@@ -1003,8 +1097,10 @@ class MainWindow(QMainWindow):
     def on_track_mode(self) -> None:
         if not self.client:
             return
-        self.canvas.set_track_mode(True)
-        self.status("画轨道: 左键依次落点, 右键或双击结束, Esc 取消")
+        self._enter_map_mode(
+            lambda: self.canvas.set_track_mode(True),
+            "画轨道: 左键依次落点，右键或双击结束，Esc 退出",
+        )
 
     def on_track_drawn(self, points: list) -> None:
         if not self.client or len(points) < 2:
@@ -1086,12 +1182,29 @@ class MainWindow(QMainWindow):
     # ---- 遥控 / 调速 (功能表 #5 #6) ----
 
     def on_move_tick(self, direction: int) -> None:
-        """遥控连发: 周期收到方向 -> move_by（带 UI 速度比例）。"""
+        """遥控连发: 周期收到方向 -> move_by（带 UI 速度）。"""
         if not self.client:
+            return
+        # 急停激活时拒绝发送运动指令, 并停止连发定时器
+        if self.estop_bus.latched:
+            self.control._stop()
             return
         try:
             ratio = self.control.teleop_speed_ratio(direction)
-            self.client.move_by(direction, speed_ratio=ratio)
+            # 同时传 speed_ratio(比例) 与绝对速度, 由固件选用;
+            # 实测 speed_ratio 在部分固件无效, 绝对速度字段更可靠。
+            if direction in (DIR_TURN_LEFT, DIR_TURN_RIGHT):
+                self.client.move_by(
+                    direction,
+                    speed_ratio=ratio,
+                    angular_velocity=self.control.current_angular_rps(),
+                )
+            else:
+                self.client.move_by(
+                    direction,
+                    speed_ratio=ratio,
+                    linear_velocity=self.control.current_linear_mps(),
+                )
         except HermesError as e:
             self.control._stop()
             self.status(f"遥控失败: {e}")
@@ -1125,9 +1238,9 @@ class MainWindow(QMainWindow):
             self.client.set_max_speed(speed)
             got = self.client.get_max_speed()
             self.control.set_speeds(got, self.client.get_max_angular_speed())
-            self.status(f"最大线速度已设为 {got:.2f} m/s（读回确认）")
+            self.status(f"最大线速度已设为 {got:.2f} m/s（读回确认）", pin_secs=4.0)
         except HermesError as e:
-            self.status(f"线速度设置失败: {e}")
+            self.status(f"线速度设置失败: {e}", pin_secs=4.0)
 
     def on_max_angular(self, speed: float) -> None:
         if not self.client:
@@ -1136,9 +1249,9 @@ class MainWindow(QMainWindow):
             self.client.set_max_angular_speed(speed)
             got = self.client.get_max_angular_speed()
             self.control.set_speeds(self.client.get_max_speed(), got)
-            self.status(f"最大角速度已设为 {got:.2f} rad/s（读回确认）")
+            self.status(f"最大角速度已设为 {got:.2f} rad/s（读回确认）", pin_secs=4.0)
         except HermesError as e:
-            self.status(f"角速度设置失败: {e}")
+            self.status(f"角速度设置失败: {e}", pin_secs=4.0)
 
     # ---- 安全: 急停 / 刹车释放 ----
 
@@ -1151,16 +1264,52 @@ class MainWindow(QMainWindow):
             ) != QMessageBox.Yes:
                 self.control.set_estop_state(False)
                 return
+            # 急停前记录臂连接态；Elite writeIdle 后仅靠 clear 无法恢复 servoj
+            self._arm_was_connected_at_estop = bool(self.arm.is_connected())
+            self.arm_worker.set_streaming(False)
+            self.arm_panel.chk_stream.blockSignals(True)
+            self.arm_panel.chk_stream.setChecked(False)
+            self.arm_panel.chk_stream.blockSignals(False)
             self.estop_bus.trigger()
             dlg = getattr(self, "_arm_seq_dlg", None)
             if dlg is not None and dlg.is_runner_active():
                 dlg.force_stop_runner(log_stop=True)
             self.control.set_estop_state(True)
-            self.status("已触发系统急停")
+            app_log.log_warn("estop", "系统急停已触发")
+            self.status("已触发系统急停", pin_secs=8.0)
             return
         self.estop_bus.release()
         self.control.set_estop_state(False)
-        self.status("已解除软件急停")
+        app_log.log_info("estop", "软件急停已解除")
+        if self._arm_was_connected_at_estop:
+            # 与手动「重新连接」等价：close + EliteDriver/脚本/hold servoj
+            self._recover_arm_after_estop()
+        else:
+            self.status("已解除软件急停", pin_secs=4.0)
+
+    def _recover_arm_after_estop(self) -> None:
+        """急停解除后重连机械臂（writeIdle 后必须完整重建外部控制会话）。"""
+        self.status("急停已解除，正在重新连接机械臂…", pin_secs=8.0)
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+        # 先停流控，避免重连窗口内 worker 继续下发
+        self.arm_worker.set_streaming(False)
+        try:
+            self.arm.disconnect()
+        except Exception:
+            pass
+        # on_arm_connect → ArmController.connect → elite close+reconnect+seed
+        self.on_arm_connect()
+        if self.arm.is_connected():
+            app_log.log_info("estop", "急停解除后机械臂已重连并开流控")
+            self.status("已解除急停；机械臂已重新连接", pin_secs=6.0)
+        else:
+            detail = self.arm.last_connect_error() or "未知错误"
+            app_log.log_error("estop", f"急停解除后臂重连失败: {detail}")
+            self.status(f"已解除急停，但机械臂重连失败: {detail}", pin_secs=8.0)
+        self._arm_was_connected_at_estop = False
 
     def on_brake_release(self, release: bool) -> None:
         """刹车释放(可手推)/恢复制动。"""
@@ -1178,8 +1327,10 @@ class MainWindow(QMainWindow):
         if not self.client:
             self.status("请先连接底盘")
             return
-        self.canvas.set_wall_mode(True)
-        self.status("在地图上按住拖拽画一条虚拟墙")
+        self._enter_map_mode(
+            lambda: self.canvas.set_wall_mode(True),
+            "画虚拟墙: 按住拖拽画线，完成后退出；Esc 可中途取消",
+        )
 
     def on_wall_drawn(self, x1: float, y1: float, x2: float, y2: float) -> None:
         if not self.client:
@@ -1269,8 +1420,10 @@ class MainWindow(QMainWindow):
     def on_reloc_mode(self) -> None:
         if not self.client:
             return
-        self.canvas.set_reloc_mode(True)
-        self.status("重定位: 在地图上按住机器人实际位置, 拖拽指向其朝向, 松开提交")
+        self._enter_map_mode(
+            lambda: self.canvas.set_reloc_mode(True),
+            "重定位: 按住实际位置并拖拽朝向后松开；Esc 退出",
+        )
 
     def on_reloc_done(self, x: float, y: float, yaw: float) -> None:
         if not self.client:
@@ -1307,8 +1460,10 @@ class MainWindow(QMainWindow):
     def on_nav_mode(self) -> None:
         if not self.client:
             return
-        self.canvas.set_nav_mode(True)
-        self.status("导航: 点击地图任意位置, 自动规划并前往")
+        self._enter_map_mode(
+            lambda: self.canvas.set_nav_mode(True),
+            "导航(连续选点): 点击地图前往下一点，Esc 退出",
+        )
 
     def on_nav_target(self, x: float, y: float) -> None:
         if not self.client:
@@ -1348,34 +1503,36 @@ class MainWindow(QMainWindow):
             self.btn_health.setStyleSheet("")
 
     def _poll_health(self) -> None:
-        """每分钟拉一次健康+定位质量(节流), 更新健康按钮颜色与状态栏提示。"""
-        if not self.client:
-            return
-        import time
+        """约 2s 节流: 底盘健康角标 + 诊断面板自动刷新。"""
         now = int(time.monotonic())
-        # 每 2 秒一次
         if self._last_health_check is not None and now - self._last_health_check < 2:
             return
         self._last_health_check = now
-        try:
-            h = self.client.get_health_items()
-        except HermesError:
-            return
-        errs = h.get("errors", [])
-        n_err = sum(1 for e in errs if e.get("level", 0) >= 2)
-        n_warn = sum(1 for e in errs if e.get("level", 0) == 1)
-        self._set_health_button(n_err, n_warn)
-        # 同步急停按钮(物理急停或他处触发时, 界面也反映)
-        self.control.set_estop_state(h.get("emergency_stop", False))
-        # 定位质量低提示
-        try:
-            q = self.client.get_localization_quality()
-            if isinstance(q, int) and q < self.LOC_QUALITY_WARN:
-                self._loc_quality_hint = f"  ⚠定位质量低({q})"
-            else:
-                self._loc_quality_hint = ""
-        except HermesError:
-            self._loc_quality_hint = ""
+        if self.client:
+            try:
+                h = self.client.get_health_items()
+            except HermesError:
+                h = None
+            if h is not None:
+                errs = h.get("errors", [])
+                n_err = sum(1 for e in errs if e.get("level", 0) >= 2)
+                n_warn = sum(1 for e in errs if e.get("level", 0) == 1)
+                self._set_health_button(n_err, n_warn)
+                # 同步急停按钮(物理急停或他处触发时, 界面也反映)
+                # 软件急停已 latch 时不覆盖按钮状态, 避免物理急停解除后错误清除 UI
+                hw_estop = h.get("emergency_stop", False)
+                if not self.estop_bus.latched:
+                    self.control.set_estop_state(hw_estop)
+                try:
+                    q = self.client.get_localization_quality()
+                    if isinstance(q, int) and q < self.LOC_QUALITY_WARN:
+                        self._loc_quality_hint = f"  ⚠定位质量低({q})"
+                    else:
+                        self._loc_quality_hint = ""
+                except HermesError:
+                    self._loc_quality_hint = ""
+        # 诊断 Tab 与健康轮询同步（无底盘时也刷新臂/相机）
+        self.refresh_diagnosis()
 
     def on_show_health(self) -> None:
         """健康信息弹窗: 列出报警, 可逐条/全部清除(对标 RoboStudio)。"""
@@ -1472,6 +1629,9 @@ class MainWindow(QMainWindow):
 
     def poll(self) -> None:
         if not self.client:
+            # 无底盘：仍节流刷新诊断（臂/相机断流等）
+            self._poll_health()
+            self._check_mission_schedule()
             return
         try:
             pose = self.client.get_pose()
@@ -1482,7 +1642,9 @@ class MainWindow(QMainWindow):
                 f"电量 {p.battery_percentage}%  "
                 f"{'充电中' if p.is_charging else p.docking_status}"
             )
-            self.status(base + self._action_suffix() + self._loc_quality_hint)
+            # 重要消息固定期间(急停/速度读回)不覆盖状态栏
+            if time.monotonic() >= self._status_pinned_until:
+                self.status(base + self._action_suffix() + self._loc_quality_hint)
         except HermesError as e:
             self.status(f"轮询异常: {e}")
         # 健康监控(节流到~2s) + 雷达点云(勾选时)
@@ -1577,6 +1739,7 @@ def main():
     from ui.theme import apply_theme
 
     _install_crash_logger()
+    app_log.setup_logging()
     app = QApplication(sys.argv)
     apply_theme(app)
 

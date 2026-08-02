@@ -236,6 +236,8 @@ class MissionEditDialog(QDialog):
         self.date_edit.setDate(QDate.currentDate())
         self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat("HH:mm")
+        self.time_edit.setTime(QTime.currentTime())
+        self._sync_calendar_popup()
         self.cmb_sched.currentIndexChanged.connect(self._on_sched_kind)
         sched = QHBoxLayout()
         sched.addWidget(QLabel("定时:"))
@@ -421,11 +423,29 @@ class MissionEditDialog(QDialog):
         self._refresh_list()
         self.list.setCurrentRow(nb)
 
+    def _sync_calendar_popup(self) -> None:
+        """让弹出日历与当前日期对齐（避免弹层停在错误年月）。"""
+        d = self.date_edit.date()
+        if not d.isValid():
+            d = QDate.currentDate()
+            self.date_edit.setDate(d)
+        cal = self.date_edit.calendarWidget()
+        if cal is not None:
+            cal.setSelectedDate(d)
+            cal.setCurrentPage(d.year(), d.month())
+
     def _on_sched_kind(self) -> None:
         kind = self.cmb_sched.currentData()
         timed = kind != ScheduleKind.NONE
         self.time_edit.setEnabled(timed)
-        self.date_edit.setEnabled(kind == ScheduleKind.ONCE)
+        once = kind == ScheduleKind.ONCE
+        self.date_edit.setEnabled(once)
+        if once:
+            # 原任务不是「单次日历」时默认今天；编辑已有单次任务保留原日期
+            orig_kind = self._orig_schedule[0] if self._orig_schedule else ScheduleKind.NONE
+            if orig_kind != ScheduleKind.ONCE or not self.date_edit.date().isValid():
+                self.date_edit.setDate(QDate.currentDate())
+            self._sync_calendar_popup()
 
     def _schedule_fields(self) -> tuple[str, str]:
         kind = self.cmb_sched.currentData()

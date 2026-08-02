@@ -14,9 +14,11 @@
 迁自 `SLAM/hermes`，包路径 `devices.chassis`。
 
 - `ping()` / 构造即连
-- `get_pose()` / `get_power_status()` / `get_health()` / `get_health_summary()`
+- `get_pose()` / `get_power_status()` / `get_health()` / `get_health_items()`
 - 地图/POI/墙/运动 action API（保持 Hermes 方法名）
 - `set_emergency_stop(on: bool)` / `abort_action()`
+
+综合健康由上层 `DiagnosisAggregator.collect_with_summary()` 产出（非底盘单接口）。
 
 ### ArmController
 
@@ -33,6 +35,7 @@
 ### CameraBackend
 
 - `open()` / `close()` / `read_bgr() -> Optional[ndarray]`
+- `last_frame_ts` / `frame_age_s()`：供诊断判定断流（无新帧超时）
 - kind：`hikvision` | `rtsp` | `usb` | `mock`
 
 ### RangingBackend
@@ -45,8 +48,28 @@
 ```text
 DeviceId = chassis | arm | camera | ranging
 ConnectionState = disconnected | connecting | connected | error
+AlarmLevel = info | warn | error | critical
 AlarmItem = {device, code, message, level}
+DeviceStatus = {device, state, detail, alarms, metrics, ok}
+OverallHealth = ok | degraded | fault
+HealthSummary = {overall, fault_count, warn_count, generated_at}
 ```
+
+### DiagnosisAggregator
+
+- `collect()` / `collect_with_summary() -> (List[DeviceStatus], HealthSummary)`
+- `collect_snapshot() -> dict`（JSON 可序列化，供日志导出）
+- 底盘：health 级别映射、电量、定位质量、当前 action、急停/雷达
+- 臂：连接、流控、软件急停闩锁、关节可读
+- 相机：分辨率、帧龄；超时无新帧 → `STALE_FRAME`
+- UI 约 2s 随 `_poll_health` 自动刷新诊断 Tab
+
+### AppLog（`core/app_log.py`）
+
+- `setup_logging()` → `~/.robot_controller/app.log`（RotatingFileHandler）
+- 内存环形缓冲；`log_info` / `log_warn` / `log_error` / `get_recent`
+- `export_bundle(path, snapshot)` → zip：`app.log`、`crash.log`（若有）、`diagnosis_snapshot.json`、`status_tail.txt`
+- 诊断面板「导出日志」触发
 
 `EStopBus.trigger()`：
 

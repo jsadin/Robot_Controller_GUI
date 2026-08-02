@@ -91,6 +91,8 @@ class MapCanvas(QGraphicsView):
     trackDrawn = pyqtSignal(list)
     # 导航模式下点击地图, 发出目标世界坐标 (x, y)
     navRequested = pyqtSignal(float, float)
+    # Esc / 取消交互模式时发出（供主窗口更新状态栏）
+    modeCancelled = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -100,6 +102,8 @@ class MapCanvas(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setBackgroundBrush(QColor(0x23, 0x27, 0x2e))  # 主题深色 #23272e
+        # 保证地图有焦点时可接收 Esc
+        self.setFocusPolicy(Qt.StrongFocus)
 
         self._grid: Optional[GridMap] = None
         self._map_item: Optional[QGraphicsPixmapItem] = None
@@ -503,7 +507,7 @@ class MapCanvas(QGraphicsView):
     # ---- 导航 (点击地图导航 + 规划路线) ----
 
     def set_nav_mode(self, on: bool) -> None:
-        """开启导航模式: 点地图任意处发 navRequested(点一次走一次)。"""
+        """开启导航模式: 连续点选目标发 navRequested；Esc 退出。"""
         self._nav_mode = on
         if on:
             self.setDragMode(QGraphicsView.NoDrag)
@@ -511,6 +515,34 @@ class MapCanvas(QGraphicsView):
         else:
             self.setDragMode(QGraphicsView.ScrollHandDrag)
             self.viewport().unsetCursor()
+
+    def has_active_mode(self) -> bool:
+        return bool(
+            self._nav_mode
+            or self._wall_mode
+            or self._track_mode
+            or self._reloc_mode
+            or self._heading_mode
+            or self._place_mode
+        )
+
+    def cancel_active_modes(self) -> bool:
+        """取消全部地图交互模式。有模式被取消时返回 True。"""
+        if not self.has_active_mode():
+            return False
+        if self._track_mode:
+            self.set_track_mode(False)
+        if self._heading_mode:
+            self._end_heading_mode()
+        if self._wall_mode:
+            self.set_wall_mode(False)
+        if self._reloc_mode:
+            self.set_reloc_mode(False)
+        if self._nav_mode:
+            self.set_nav_mode(False)
+        if self._place_mode:
+            self.set_place_mode(False)
+        return True
 
     def set_path(self, world_points) -> None:
         """渲染规划/剩余路线。world_points: [(x,y),...] 世界坐标。空则清空。"""
@@ -571,10 +603,9 @@ class MapCanvas(QGraphicsView):
                 self.set_place_mode(False)
                 QTimer.singleShot(0, lambda: self.placeRequested.emit(x, y))
                 return
-            # 导航模式: 点哪去哪, 然后退出导航模式
+            # 导航模式: 连续选点, Esc 退出（不在此关闭模式）
             if self._nav_mode:
                 x, y = self.scene_to_world(scene_pt)
-                self.set_nav_mode(False)
                 QTimer.singleShot(0, lambda: self.navRequested.emit(x, y))
                 return
             # 画墙模式: 记起点, 开始拖拽预览
@@ -702,21 +733,9 @@ class MapCanvas(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event):
-        # Esc 取消当前绘制/编辑模式
+        # Esc 取消当前绘制/编辑/导航/放置模式
         if event.key() == Qt.Key_Escape:
-            if self._track_mode:
-                self.set_track_mode(False)
-                return
-            if self._heading_mode:
-                self._end_heading_mode()
-                return
-            if self._wall_mode:
-                self.set_wall_mode(False)
-                return
-            if self._reloc_mode:
-                self.set_reloc_mode(False)
-                return
-            if self._nav_mode:
-                self.set_nav_mode(False)
+            if self.cancel_active_modes():
+                self.modeCancelled.emit()
                 return
         super().keyPressEvent(event)

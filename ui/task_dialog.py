@@ -107,6 +107,9 @@ class TaskDialog(QDialog):
         self.date_edit.setDate(QDate.currentDate())
         self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat("HH:mm")
+        self.time_edit.setTime(QTime.currentTime())
+        self._orig_sched_kind = task.schedule_kind if task else ScheduleKind.NONE
+        self._sync_calendar_popup()
         self.cmb_sched.currentIndexChanged.connect(self._on_sched_kind)
 
         sched = QHBoxLayout()
@@ -204,11 +207,26 @@ class TaskDialog(QDialog):
             self.seq.insertItem(new, it)
             self.seq.setCurrentRow(new)
 
+    def _sync_calendar_popup(self) -> None:
+        d = self.date_edit.date()
+        if not d.isValid():
+            d = QDate.currentDate()
+            self.date_edit.setDate(d)
+        cal = self.date_edit.calendarWidget()
+        if cal is not None:
+            cal.setSelectedDate(d)
+            cal.setCurrentPage(d.year(), d.month())
+
     def _on_sched_kind(self) -> None:
         kind = self.cmb_sched.currentData()
         timed = kind != ScheduleKind.NONE
         self.time_edit.setEnabled(timed)
-        self.date_edit.setEnabled(kind == ScheduleKind.ONCE)
+        once = kind == ScheduleKind.ONCE
+        self.date_edit.setEnabled(once)
+        if once:
+            if self._orig_sched_kind != ScheduleKind.ONCE or not self.date_edit.date().isValid():
+                self.date_edit.setDate(QDate.currentDate())
+            self._sync_calendar_popup()
 
     # ---- 结果 ----
 

@@ -87,8 +87,14 @@ class ArmController:
         self._robot.emergency_stop()
 
     def clear_emergency_stop(self) -> None:
+        """解除软件闩锁，并让后端退出 idle / 重同步规划器。"""
         self._motion_halted = False
         self._robot.clear_emergency_stop()
+        # 以当前反馈为期望角，避免解除后按急停前目标猛冲或卡死
+        try:
+            self.seed_from_feedback()
+        except Exception:
+            pass
 
     def seed_from_feedback(self) -> None:
         j = self._robot.read_joints_rad()

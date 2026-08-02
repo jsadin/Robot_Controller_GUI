@@ -12,7 +12,7 @@
 | 4 | 主界面监测/全屏 | phase1–2 | `ui/main_window.py` |
 | 5 | 急停整机 | phase0–1 | `devices/common/estop_bus.py` |
 | 6 | 外部报警灯 | stub | `devices/common/alarm_light.py` |
-| 7 | 诊断 | phase2 | `ui/diagnosis_panel.py` + `core/diagnosis.py` |
+| 7 | 诊断 | phase2 | `ui/diagnosis_panel.py` + `core/diagnosis.py`：运行态指标、约 2s 周期刷新、综合健康；`core/app_log.py` 落盘+环形缓冲，诊断页一键导出 zip |
 
 ## 底盘
 

@@ -41,8 +41,12 @@ class TestConfigAndDevices(unittest.TestCase):
         bus.trigger()
         self.assertTrue(bus.latched)
         self.assertTrue(arm.motion_halted)
+        self.assertFalse(arm.advance_joint_command())
         bus.release()
         self.assertFalse(bus.latched)
+        self.assertFalse(arm.motion_halted)
+        arm.sync_joint_desired_deg([20, 0, 0, 0, 0, 0])
+        self.assertTrue(arm.advance_joint_command())
 
     def test_mock_camera_frame(self):
         from devices.camera import MockCameraBackend

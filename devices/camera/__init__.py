@@ -19,6 +19,11 @@ class CameraBackend(Protocol):
     def read_bgr(self) -> Optional[np.ndarray]: ...
     def is_open(self) -> bool: ...
 
+    @property
+    def last_frame_ts(self) -> Optional[float]: ...
+
+    def frame_age_s(self) -> Optional[float]: ...
+
 
 def build_hikvision_rtsp_url(
     host: str,
@@ -40,16 +45,31 @@ def build_hikvision_rtsp_url(
 class MockCameraBackend:
     def __init__(self) -> None:
         self._open = False
+        self._last_frame_ts: Optional[float] = None
+        self.opened_at: Optional[float] = None
 
     def open(self) -> bool:
         self._open = True
+        self.opened_at = time.monotonic()
+        self._last_frame_ts = None
         return True
 
     def close(self) -> None:
         self._open = False
+        self.opened_at = None
+        self._last_frame_ts = None
 
     def is_open(self) -> bool:
         return bool(self._open)
+
+    @property
+    def last_frame_ts(self) -> Optional[float]:
+        return self._last_frame_ts
+
+    def frame_age_s(self) -> Optional[float]:
+        if self._last_frame_ts is None:
+            return None
+        return max(0.0, time.monotonic() - self._last_frame_ts)
 
     def read_bgr(self) -> Optional[np.ndarray]:
         if not self._open:
@@ -58,6 +78,7 @@ class MockCameraBackend:
         img = np.zeros((240, 320, 3), dtype=np.uint8)
         img[:, :, 1] = 80
         img[60:180, 80:240, 2] = 200
+        self._last_frame_ts = time.monotonic()
         return img
 
 
@@ -73,6 +94,8 @@ class OpenCvCameraBackend:
         self._stop_event: threading.Event | None = None
         self._frame_lock = threading.Lock()
         self._latest_bgr: np.ndarray | None = None
+        self._last_frame_ts: Optional[float] = None
+        self.opened_at: Optional[float] = None
 
     def _capture_source(self) -> int | str:
         url = (self._cfg.rtsp_url or "").strip()
@@ -108,6 +131,8 @@ class OpenCvCameraBackend:
         if not self._cap.isOpened():
             self._cap = None
             return False
+        self.opened_at = time.monotonic()
+        self._last_frame_ts = None
         self._stop_event = threading.Event()
         self._reader_thread = threading.Thread(
             target=self._reader_loop, name="camera_reader", daemon=True
@@ -124,6 +149,7 @@ class OpenCvCameraBackend:
             if ok and frame is not None:
                 with self._frame_lock:
                     self._latest_bgr = frame
+                    self._last_frame_ts = time.monotonic()
             else:
                 self._stop_event.wait(0.02)
 
@@ -139,9 +165,23 @@ class OpenCvCameraBackend:
             self._cap = None
         with self._frame_lock:
             self._latest_bgr = None
+            self._last_frame_ts = None
+        self.opened_at = None
 
     def is_open(self) -> bool:
         return self._cap is not None and self._cap.isOpened()
+
+    @property
+    def last_frame_ts(self) -> Optional[float]:
+        with self._frame_lock:
+            return self._last_frame_ts
+
+    def frame_age_s(self) -> Optional[float]:
+        with self._frame_lock:
+            ts = self._last_frame_ts
+        if ts is None:
+            return None
+        return max(0.0, time.monotonic() - ts)
 
     def read_bgr(self) -> Optional[np.ndarray]:
         with self._frame_lock:

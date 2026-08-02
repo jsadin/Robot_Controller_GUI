@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List
+from typing import Any, Dict, List
 
 
 class DeviceId(str, Enum):
@@ -28,6 +28,12 @@ class AlarmLevel(str, Enum):
     CRITICAL = "critical"
 
 
+class OverallHealth(str, Enum):
+    OK = "ok"
+    DEGRADED = "degraded"
+    FAULT = "fault"
+
+
 @dataclass
 class AlarmItem:
     device: DeviceId
@@ -42,3 +48,13 @@ class DeviceStatus:
     state: ConnectionState = ConnectionState.DISCONNECTED
     detail: str = ""
     alarms: List[AlarmItem] = field(default_factory=list)
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    ok: bool = True
+
+
+@dataclass
+class HealthSummary:
+    overall: OverallHealth = OverallHealth.OK
+    fault_count: int = 0
+    warn_count: int = 0
+    generated_at: float = 0.0

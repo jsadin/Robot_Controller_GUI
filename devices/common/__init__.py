@@ -1,6 +1,14 @@
 from devices.common.alarm_light import AlarmLightPort
 from devices.common.estop_bus import EStopBus
-from devices.common.status import AlarmItem, AlarmLevel, ConnectionState, DeviceId, DeviceStatus
+from devices.common.status import (
+    AlarmItem,
+    AlarmLevel,
+    ConnectionState,
+    DeviceId,
+    DeviceStatus,
+    HealthSummary,
+    OverallHealth,
+)
 
 __all__ = [
     "AlarmLightPort",
@@ -10,4 +18,6 @@ __all__ = [
     "DeviceId",
     "DeviceStatus",
     "EStopBus",
+    "HealthSummary",
+    "OverallHealth",
 ]

@@ -307,6 +307,7 @@ class EliteCsRobotBackend:
         return JointState6(tuple(float(x) for x in j[:6]))
 
     def emergency_stop(self) -> None:
+        """进入 idle，停止接受持续 servoj（软急停）。"""
         if self._driver is None:
             return
         try:
@@ -315,7 +316,41 @@ class EliteCsRobotBackend:
             pass
 
     def clear_emergency_stop(self) -> None:
-        pass
+        """退出 idle：按下发 hold servoj 重新接管外部控制。
+
+        ``writeIdle`` 后若不恢复 servoj 流，控制器会一直停在 idle，
+        软件闩锁虽已解除但臂表现为「连着却不动」。
+        """
+        if self._driver is None:
+            return
+        try:
+            if not self.is_connected():
+                return
+        except Exception:
+            return
+        pose = self.read_joints_rad()
+        if pose is None:
+            pose = self._last_cmd
+        if pose is None:
+            return
+        self._last_cmd = pose
+        hold_ms = int(self._cfg.servoj_hold_timeout_ms)
+        pos = list(pose.q)
+        try:
+            ok = bool(self._driver.writeServoj(pos, hold_ms, False))
+            if not ok:
+                ms = int(self._cfg.servoj_timeout_ms)
+                ok = bool(self._driver.writeServoj(pos, ms, False))
+            if not ok:
+                print(
+                    "[elite_teleop_gui] WARN: clear_emergency_stop writeServoj returned false.",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(
+                f"[elite_teleop_gui] WARN: clear_emergency_stop failed: {_exc_message(exc)}",
+                file=sys.stderr,
+            )
 
     def command_joints_rad(self, joints: JointState6, timeout_ms: int | None = None) -> bool:
         if self._driver is None:
