@@ -5,11 +5,94 @@ from __future__ import annotations
 import importlib
 import socket
 import sys
+import tempfile
 import time
+from pathlib import Path
 from types import ModuleType
 
 from devices.arm.elite_config import EliteBackendConfig
 from devices.arm.types import CartesianTarget, JointState6
+
+_HEADER_END = "# HEADER_END"
+_START_SCRIPT_CMD_THREAD = "script_command_thread_handle = start_thread(scriptCommands, ())"
+_STOP_SCRIPT_CMD_THREAD = "stop_thread(script_command_thread_handle)"
+
+
+def inject_cabinet_ranging_thread(
+    script: str,
+    *,
+    baud: int = 115200,
+    parity: int = 0,
+    slave: int = 1,
+) -> str:
+    """把柜体 HF 测距线程织入 Elite 外部控制脚本，与 servoj 并行。"""
+    if "def rangingThread():" in script:
+        return script
+    if _HEADER_END not in script or _START_SCRIPT_CMD_THREAD not in script:
+        return script
+    if _STOP_SCRIPT_CMD_THREAD not in script:
+        return script
+
+    fn = (
+        "def packRangeBits(tenths, valid):\n"
+        "    t = int(tenths)\n"
+        "    if t < 1:\n"
+        "        t = 0\n"
+        "        valid = False\n"
+        "    if t >= 65535:\n"
+        "        t = 0\n"
+        "        valid = False\n"
+        "    n = t\n"
+        "    i = 0\n"
+        "    while i < 16:\n"
+        "        write_output_boolean_register(i, (n % 2) != 0)\n"
+        "        n = n // 2\n"
+        "        i = i + 1\n"
+        "    n = 65535 - t\n"
+        "    while i < 32:\n"
+        "        write_output_boolean_register(i, (n % 2) != 0)\n"
+        "        n = n // 2\n"
+        "        i = i + 1\n"
+        "    write_output_boolean_register(32, bool(valid) and t > 0)\n"
+        "\n"
+        "def rangingThread():\n"
+        "    global control_mode\n"
+        "    configured = False\n"
+        "    while control_mode > MODE_STOPPED:\n"
+        "        try:\n"
+        "            if not configured:\n"
+        f"                ok = masterboard_serial_config(True, {int(baud)}, {int(parity)}, 1, 8, True)\n"
+        "                if ok:\n"
+        "                    configured = True\n"
+        "                else:\n"
+        "                    packRangeBits(0, False)\n"
+        "                    sleep(0.5)\n"
+        "                    continue\n"
+        f"            d = masterboard_modbus_rtu_read_input_registers({int(slave)}, 0, 2, 0.4)\n"
+        "            if d and len(d) >= 2 and d[0] == 0 and d[1] > 0 and d[1] < 65535:\n"
+        "                packRangeBits(d[1], True)\n"
+        "            else:\n"
+        "                packRangeBits(0, False)\n"
+        "        except Exception as e:\n"
+        '            textmsg("ranging: " + str(e))\n'
+        "            packRangeBits(0, False)\n"
+        "            configured = False\n"
+        "        sleep(0.25)\n"
+        "\n"
+    )
+    text = script.replace(_HEADER_END, fn + _HEADER_END, 1)
+    text = text.replace(
+        _START_SCRIPT_CMD_THREAD,
+        _START_SCRIPT_CMD_THREAD + "\nranging_thread_handle = start_thread(rangingThread, ())",
+        1,
+    )
+    text = text.replace(
+        _STOP_SCRIPT_CMD_THREAD,
+        "stop_thread(ranging_thread_handle)\njoin_thread(ranging_thread_handle)\n"
+        + _STOP_SCRIPT_CMD_THREAD,
+        1,
+    )
+    return text
 
 
 def _load_sdk() -> ModuleType:
@@ -58,6 +141,9 @@ class EliteCsRobotBackend:
         self._last_cmd = JointState6((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
         self._last_cart_pose: CartesianTarget | None = None
         self._last_connect_error: str | None = None
+        self._board_rs485 = None
+        self._board_rs485_password = ""
+        self._board_rs485_bridge_ok = False
 
     @property
     def last_connect_error(self) -> str | None:
@@ -167,7 +253,12 @@ class EliteCsRobotBackend:
 
         hold_ms = int(self._cfg.servoj_hold_timeout_ms)
         try:
-            ok = bool(self._driver.writeServoj(list(self._last_cmd.q), hold_ms, False))
+            ok = False
+            for _ in range(8):
+                ok = bool(self._driver.writeServoj(list(self._last_cmd.q), hold_ms, False))
+                if ok:
+                    break
+                time.sleep(0.05)
             if not ok:
                 print(
                     "[elite_teleop_gui] WARN: Initial hold writeServoj returned false.",
@@ -202,6 +293,33 @@ class EliteCsRobotBackend:
 
                 root = os.path.dirname(os.path.abspath(pkg.__file__))
                 sf = os.path.join(root, "external_control.script")
+        if self._cfg.ranging_in_ext_script and sf:
+            try:
+                raw = Path(sf).read_text(encoding="utf-8")
+                patched = inject_cabinet_ranging_thread(
+                    raw,
+                    baud=int(self._cfg.ranging_baud or 115200),
+                    parity=int(self._cfg.ranging_parity or 0),
+                    slave=int(self._cfg.ranging_slave or 1),
+                )
+                if patched != raw:
+                    out = Path(tempfile.gettempdir()) / "elite_ext_ctrl_ranging.script"
+                    out.write_text(patched, encoding="utf-8")
+                    sf = str(out)
+                    print(
+                        "[elite_teleop_gui] cabinet ranging thread injected into external_control.script",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "[elite_teleop_gui] WARN: ranging inject skipped (script markers missing).",
+                        file=sys.stderr,
+                    )
+            except OSError as exc:
+                print(
+                    f"[elite_teleop_gui] WARN: ranging inject failed: {_exc_message(exc)}",
+                    file=sys.stderr,
+                )
         dc.script_file_path = sf
         dc.headless_mode = bool(self._cfg.headless_mode)
         return dc
@@ -274,6 +392,7 @@ class EliteCsRobotBackend:
         return True
 
     def close(self) -> None:
+        self._close_board_rs485()
         if self._rtsi is not None:
             try:
                 self._rtsi.disconnect()
@@ -305,6 +424,133 @@ class EliteCsRobotBackend:
         if j is None or len(j) < 6:
             return None
         return JointState6(tuple(float(x) for x in j[:6]))
+
+    def get_output_bit_registers_0_31(self) -> int | None:
+        """RTSI 已订阅的 output_bit_registers0_to_31（Elite 无 int 寄存器配方项）。"""
+        if self._rtsi is None:
+            return None
+        try:
+            return int(self._rtsi.getOutBoolRegisters0To31())
+        except Exception:
+            return None
+
+    def get_output_bool_register(self, index: int) -> bool | None:
+        if self._rtsi is None:
+            return None
+        try:
+            return bool(self._rtsi.getOutBoolRegister(int(index)))
+        except Exception:
+            return None
+
+    def get_output_int_register(self, index: int) -> int | None:
+        if self._rtsi is None:
+            return None
+        try:
+            return int(self._rtsi.getOutIntRegister(int(index)))
+        except Exception:
+            return None
+
+    def get_analog_output(self, index: int = 0) -> float | None:
+        if self._rtsi is None:
+            return None
+        try:
+            return float(self._rtsi.getAnalogOutput(int(index)))
+        except Exception:
+            return None
+
+    def _serial_config(self, baud: int, parity: int):
+        sc = self._cs.SerialConfig()
+        br_name = f"BR_{int(baud)}"
+        br = getattr(self._cs.SerialConfig, br_name, None)
+        if br is None:
+            nested = getattr(self._cs.SerialConfig, "BaudRate", None)
+            br = getattr(nested, br_name, None) if nested is not None else None
+        if br is None:
+            br = getattr(self._cs.SerialConfig, "BR_115200", None)
+        sc.baud_rate = br
+        par = self._cs.SerialConfig.NONE
+        if int(parity) == 1:
+            par = self._cs.SerialConfig.ODD
+        elif int(parity) == 2:
+            par = self._cs.SerialConfig.EVEN
+        sc.parity = par
+        sc.stop_bits = self._cs.SerialConfig.ONE
+        return sc
+
+    def _close_board_rs485(self) -> None:
+        com = self._board_rs485
+        self._board_rs485 = None
+        self._board_rs485_bridge_ok = False
+        if com is None:
+            return
+        drv = self._driver
+        pw = self._board_rs485_password
+        try:
+            if drv is not None:
+                drv.endBoardRs485(com, pw)
+            else:
+                com.disconnect()
+        except Exception:
+            try:
+                com.disconnect()
+            except Exception:
+                pass
+
+    def read_cabinet_rs485(
+        self,
+        payload: bytes,
+        *,
+        read_n: int = 9,
+        timeout_ms: int = 800,
+        ssh_password: str = "",
+        baud: int = 115200,
+        parity: int = 0,
+        tcp_port: int = 54322,
+    ) -> bytes | None:
+        if not ssh_password:
+            return None
+        if self._board_rs485 is None and not self._board_rs485_bridge_ok:
+            # 不要调用 SDK startBoardRs485：它会向 30001 下发 sec，
+            # 失败时控制器会停掉外部控制，表现为连上后几秒机械臂不再动。
+            from devices.arm.cabinet_rs485 import ensure_python_bridge, tcp_open
+
+            if tcp_open(self._cfg.robot_ip, int(tcp_port), 0.8):
+                self._board_rs485_bridge_ok = True
+                self._board_rs485_password = str(ssh_password)
+            else:
+                err = ensure_python_bridge(
+                    self._cfg.robot_ip,
+                    str(ssh_password),
+                    tcp_port=int(tcp_port),
+                    baud=int(baud),
+                    parity=int(parity),
+                )
+                if err:
+                    print(f"[elite_teleop_gui] cabinet 485 bridge: {err}", file=sys.stderr)
+                    return None
+                self._board_rs485_bridge_ok = True
+                self._board_rs485_password = str(ssh_password)
+        if self._board_rs485 is not None:
+            try:
+                self._board_rs485.write(payload)
+                return bytes(self._board_rs485.read(int(read_n), int(timeout_ms)) or b"")
+            except Exception as exc:
+                print(f"[elite_teleop_gui] board RS485 xfer failed: {exc}", file=sys.stderr)
+                return None
+        from devices.arm.cabinet_rs485 import xfer
+
+        try:
+            return xfer(
+                self._cfg.robot_ip,
+                payload,
+                tcp_port=int(tcp_port),
+                read_n=int(read_n),
+                timeout_ms=int(timeout_ms),
+            )
+        except Exception as exc:
+            print(f"[elite_teleop_gui] cabinet 485 tcp xfer failed: {exc}", file=sys.stderr)
+            self._board_rs485_bridge_ok = False
+            return None
 
     def emergency_stop(self) -> None:
         """进入 idle，停止接受持续 servoj（软急停）。"""

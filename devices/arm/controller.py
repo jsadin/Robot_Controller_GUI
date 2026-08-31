@@ -41,6 +41,10 @@ def build_arm_backend(cfg: DevicesConfig) -> _ArmBackend:
             skip_rtsi=bool(cfg.arm.skip_rtsi),
             rtsi_output_recipe=str(cfg.arm.rtsi_output_recipe or ""),
             rtsi_input_recipe=str(cfg.arm.rtsi_input_recipe or ""),
+            ranging_in_ext_script=False,
+            ranging_baud=int(cfg.ranging.baud or 115200),
+            ranging_parity=int(cfg.ranging.parity or 0),
+            ranging_slave=int(cfg.ranging.slave or 1),
         )
         return EliteCsRobotBackend(ec)
     raise ValueError(f"unknown arm kind: {cfg.arm.kind!r}")
@@ -151,6 +155,69 @@ class ArmController:
 
     def joint_at_target(self) -> bool:
         return self._joint_planner.at_target()
+
+    def get_output_bit_registers_0_31(self) -> Optional[int]:
+        fn = getattr(self._robot, "get_output_bit_registers_0_31", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn()
+        except Exception:
+            return None
+
+    def get_output_bool_register(self, index: int) -> Optional[bool]:
+        fn = getattr(self._robot, "get_output_bool_register", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(int(index))
+        except Exception:
+            return None
+
+    def get_output_int_register(self, index: int) -> Optional[int]:
+        fn = getattr(self._robot, "get_output_int_register", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(int(index))
+        except Exception:
+            return None
+
+    def get_analog_output(self, index: int = 0) -> Optional[float]:
+        fn = getattr(self._robot, "get_analog_output", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(int(index))
+        except Exception:
+            return None
+
+    def read_cabinet_rs485(
+        self,
+        payload: bytes,
+        *,
+        read_n: int = 9,
+        timeout_ms: int = 800,
+        ssh_password: str = "",
+        baud: int = 115200,
+        parity: int = 0,
+        tcp_port: int = 54322,
+    ) -> Optional[bytes]:
+        fn = getattr(self._robot, "read_cabinet_rs485", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(
+                payload,
+                read_n=int(read_n),
+                timeout_ms=int(timeout_ms),
+                ssh_password=str(ssh_password or ""),
+                baud=int(baud),
+                parity=int(parity),
+                tcp_port=int(tcp_port),
+            )
+        except Exception:
+            return None
 
     # ---- 预留（功能表明细 stub）----
     def brake_release(self) -> bool:

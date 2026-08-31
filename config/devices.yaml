@@ -25,14 +25,24 @@ camera:
   user: "admin"
   password: ""                # 或环境变量 ROBOT_CAMERA_PASSWORD
   port: 554
-  stream_path: "/h264/ch1/main/av_stream"
+  stream_path: "/Streaming/Channels/102"  # 预览子码流（低延迟）；主码流 2560x1440 会明显滞后
   rtsp_url: ""                # 非空则优先于 hikvision 组装
   usb_index: 0
+  http_port: 80               # ISAPI 网页端口（变焦）
+  ptz_channel: 1
+  zoom_speed: 50              # 连续变焦速度 1–100
+  auto_zoom: true             # 默认自动变焦；测距 ≤1000mm 最短焦，>1000mm/过远最长焦
+  auto_zoom_near_m: 1.0
+  auto_zoom_travel_ms: 8000   # 赶到机械止挡的按住时长
 
 ranging:
   enabled: false
-  host: ""
-  port: 0
+  kind: elite_cabinet_rs485   # stub | elite_cabinet_rs485（柜体 RS485，随外部控制线程并行）
+  host: ""                    # 空则使用 arm.host
+  port: 0                     # PC 回连端口，0=18770
+  slave: 1
+  baud: 115200                # 本机 HF 实测 115200 8N1（手册默认 9600）
+  parity: 0                   # 0无校验 1奇 2偶
 
 paths:
   data_dir: ""                # 空则使用 ~/.robot_controller

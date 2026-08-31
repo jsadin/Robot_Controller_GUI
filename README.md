@@ -25,7 +25,7 @@ python -m ui.main_window --offline
 |------|------|
 | 底盘 | 192.168.11.1:1448 |
 | 机械臂 | 192.168.11.150（`kind: mock` 或 `elite_cs`） |
-| 摄像头 | 192.168.11.101 |
+| 摄像头 | 192.168.11.103 |
 | PC local_ip | 臂 reverse socket 回连地址 |
 
 本地覆盖（勿提交）：`config/devices.local.yaml`  

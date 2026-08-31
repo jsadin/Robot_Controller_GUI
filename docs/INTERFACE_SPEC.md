@@ -37,11 +37,19 @@
 - `open()` / `close()` / `read_bgr() -> Optional[ndarray]`
 - `last_frame_ts` / `frame_age_s()`：供诊断判定断流（无新帧超时）
 - kind：`hikvision` | `rtsp` | `usb` | `mock`
+- 海康变焦（ISAPI，不依赖 HCNetSDK）：`zoom_start` / `ptz_stop`
+  - 预览默认子码流 `/Streaming/Channels/102`（低延迟）；抓拍走 ISAPI 主码流 JPEG
+  - 配置：`http_port`（默认 80）、`ptz_channel`、`zoom_speed`
+  - 自动变焦（默认开，可取消）：测距 ``d ≤ auto_zoom_near_m``（默认 1.0m / 1000mm）最短焦；有效 ``d > 1000mm`` 或测距仪回过远哨兵最长焦。启动后未出有效读数不动作。行程中续发连续变倍。手动按住变焦±会退出自动。
 
 ### RangingBackend
 
 - `get_distance_m() -> Optional[float]`
-- `enabled=false` 时为 stub，恒返回 `None`
+- `enabled=false` 或 `kind=stub` 时恒返回 `None`
+- `kind=elite_cabinet_rs485`：柜体 HF MODBUS-RTU
+  - 机械臂已连接且配置了 ``ranging.ssh_password``：SSH 起 Python 桥读 ``/dev/ttyBoard``（不向 30001 发脚本，以免打断外部控制）
+  - 机械臂已连接但无 SSH 密码：30001 ``sec`` 读 485，用 ``%`` 移位写入布尔寄存器（不用 ``&``）
+  - 未接臂：30001 ``def`` + socket
 
 ## 3. 统一状态与急停
 

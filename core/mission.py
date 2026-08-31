@@ -464,7 +464,12 @@ class MissionExecutor:
             if raise_on_fail:
                 raise RuntimeError(msg)
             return False
-        frame = self.camera.read_bgr()
+        frame = None
+        snap = getattr(self.camera, "snapshot_bgr", None)
+        if callable(snap):
+            frame = snap()
+        if frame is None:
+            frame = self.camera.read_bgr()
         if frame is None:
             msg = "抓拍失败：无画面（请先打开摄像头）"
             self.on_status(msg)

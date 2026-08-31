@@ -59,6 +59,17 @@ QPushButton#primary:disabled {{ background-color: #34506f; border-color: #34506f
 QPushButton#danger {{ border-color: {DANGER}; color: #ff9b9b; }}
 QPushButton#danger:hover {{ background-color: {DANGER}; color: #ffffff; }}
 
+/* 开关按钮 (objectName=toggle)：勾选蓝，未勾选灰 */
+QPushButton#toggle:checked {{
+    background-color: {ACCENT};
+    border: 1px solid {ACCENT};
+    color: #ffffff;
+    font-weight: bold;
+}}
+QPushButton#toggle:checked:hover {{ background-color: #4d97ff; }}
+QPushButton#toggle:checked:pressed {{ background-color: {ACCENT_DOWN}; }}
+QPushButton#toggle:disabled {{ color: #5b6370; border-color: #353b44; }}
+
 /* 输入框 / 下拉 */
 QLineEdit, QComboBox, QTimeEdit, QSpinBox {{
     background-color: {CTRL};

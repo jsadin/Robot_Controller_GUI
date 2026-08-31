@@ -9,6 +9,15 @@ arm:
 
 camera:
   kind: hikvision
-  host: "192.168.11.101"
+  host: "192.168.11.103"
   user: "admin"
   # password: ""              # 或设环境变量 ROBOT_CAMERA_PASSWORD
+
+ranging:
+  enabled: true
+  kind: elite_cabinet_rs485
+  baud: 115200                # 本机 HF 实测；手册默认 9600
+  parity: 0
+  slave: 1
+  # ssh_password: ""          # 柜体 SSH。填写后走官方 startBoardRs485，与机械臂并行测距
+  # 也可设环境变量 ROBOT_CABINET_SSH_PASSWORD

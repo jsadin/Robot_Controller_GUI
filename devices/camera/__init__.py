@@ -11,6 +11,7 @@ from urllib.parse import quote
 import numpy as np
 
 from devices.config_loader import CameraCfg, DevicesConfig
+from devices.camera.hikvision_isapi import HikvisionIsapi
 
 
 class CameraBackend(Protocol):
@@ -24,6 +25,15 @@ class CameraBackend(Protocol):
 
     def frame_age_s(self) -> Optional[float]: ...
 
+    def ptz_available(self) -> bool: ...
+    def zoom_start(self, direction: int) -> bool: ...
+    def ptz_stop(self) -> bool: ...
+    def ptz_last_error(self) -> str: ...
+    def last_open_error(self) -> str: ...
+    def ptz_caps(self) -> dict: ...
+    def refresh_ptz_caps(self) -> dict: ...
+    def snapshot_bgr(self) -> Optional[np.ndarray]: ...
+
 
 def build_hikvision_rtsp_url(
     host: str,
@@ -31,15 +41,26 @@ def build_hikvision_rtsp_url(
     user: str = "admin",
     password: str = "",
     port: int = 554,
-    stream_path: str = "/h264/ch1/main/av_stream",
+    stream_path: str = "/Streaming/Channels/102",
 ) -> str:
     h = host.strip()
     if not h:
         raise ValueError("hikvision host is empty")
-    path = stream_path.strip() or "/h264/ch1/main/av_stream"
+    path = stream_path.strip() or "/Streaming/Channels/102"
     if not path.startswith("/"):
         path = "/" + path
     return f"rtsp://{quote(user, safe='')}:{quote(password, safe='')}@{h}:{int(port)}{path}"
+
+
+def _preview_stream_path(stream_path: str) -> str:
+    """预览强制走子码流。主码流 2560×1440 / GOP50 会把变焦画面拖到 1～2 秒。"""
+    p = (stream_path or "").strip() or "/Streaming/Channels/102"
+    low = p.lower().replace("\\", "/")
+    if "main" in low or "/channels/101" in low or low.endswith("/101"):
+        return "/Streaming/Channels/102"
+    if not p.startswith("/"):
+        p = "/" + p
+    return p
 
 
 class MockCameraBackend:
@@ -47,6 +68,27 @@ class MockCameraBackend:
         self._open = False
         self._last_frame_ts: Optional[float] = None
         self.opened_at: Optional[float] = None
+
+    def ptz_available(self) -> bool:
+        return False
+
+    def zoom_start(self, direction: int) -> bool:
+        return False
+
+    def ptz_stop(self) -> bool:
+        return True
+
+    def ptz_last_error(self) -> str:
+        return ""
+
+    def last_open_error(self) -> str:
+        return ""
+
+    def ptz_caps(self) -> dict:
+        return {"probed": True, "zoom": False, "detail": ""}
+
+    def refresh_ptz_caps(self) -> dict:
+        return self.ptz_caps()
 
     def open(self) -> bool:
         self._open = True
@@ -81,8 +123,16 @@ class MockCameraBackend:
         self._last_frame_ts = time.monotonic()
         return img
 
+    def snapshot_bgr(self) -> Optional[np.ndarray]:
+        return self.read_bgr()
 
-_RTSP_FFMPEG_OPTS = "rtsp_transport;tcp|fflags;nobuffer|max_delay;500000"
+
+# OpenCV FFmpeg：低延迟（旧值 max_delay=500ms 会明显拖后变焦画面）
+_RTSP_FFMPEG_OPTS = (
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|"
+    "max_delay;0|framedrop;1"
+)
+_PREVIEW_MAX_W = 960
 
 
 class OpenCvCameraBackend:
@@ -96,6 +146,38 @@ class OpenCvCameraBackend:
         self._latest_bgr: np.ndarray | None = None
         self._last_frame_ts: Optional[float] = None
         self.opened_at: Optional[float] = None
+        self._last_open_error: str = ""
+        self._isapi = HikvisionIsapi(cfg)
+
+    def last_open_error(self) -> str:
+        return self._last_open_error
+
+    def ptz_available(self) -> bool:
+        return self._isapi.available()
+
+    def zoom_start(self, direction: int) -> bool:
+        return bool(self._isapi.zoom_start(direction))
+
+    def ptz_stop(self) -> bool:
+        if not self.ptz_available():
+            return False
+        self._isapi.stop()
+        return True
+
+    def ptz_last_error(self) -> str:
+        return self._isapi.last_error
+
+    def ptz_caps(self) -> dict:
+        c = self._isapi.caps
+        return {
+            "probed": bool(c.probed),
+            "zoom": bool(c.zoom),
+            "detail": c.detail or "",
+        }
+
+    def refresh_ptz_caps(self) -> dict:
+        self._isapi.refresh_capabilities()
+        return self.ptz_caps()
 
     def _capture_source(self) -> int | str:
         url = (self._cfg.rtsp_url or "").strip()
@@ -108,27 +190,47 @@ class OpenCvCameraBackend:
                 user=self._cfg.user,
                 password=self._cfg.password,
                 port=self._cfg.port,
-                stream_path=self._cfg.stream_path,
+                stream_path=_preview_stream_path(self._cfg.stream_path),
             )
         return int(self._cfg.usb_index)
 
     def open(self) -> bool:
         self.close()
+        self._last_open_error = ""
         try:
             import cv2
         except ImportError:
+            self._last_open_error = "未安装 OpenCV"
             return False
+        try:
+            self._isapi.tune_preview_stream(102)
+        except Exception:
+            pass
         src = self._capture_source()
         self._using_rtsp = isinstance(src, str) and str(src).lower().startswith("rtsp://")
         if self._using_rtsp:
-            prev = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "").strip()
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                f"{prev}|{_RTSP_FFMPEG_OPTS}" if prev else _RTSP_FFMPEG_OPTS
-            )
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = _RTSP_FFMPEG_OPTS
             self._cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+            try:
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
         else:
             self._cap = cv2.VideoCapture(src)
+            try:
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
         if not self._cap.isOpened():
+            host = (self._cfg.host or "").strip()
+            kind = (self._cfg.kind or "").lower()
+            if kind in ("hikvision", "rtsp") and host:
+                self._last_open_error = (
+                    f"RTSP 打开失败 {host}:{int(self._cfg.port)} "
+                    f"（请核对 devices.local.yaml 的 camera.host）"
+                )
+            else:
+                self._last_open_error = f"打开失败 source={src!r}"
             self._cap = None
             return False
         self.opened_at = time.monotonic()
@@ -138,20 +240,47 @@ class OpenCvCameraBackend:
             target=self._reader_loop, name="camera_reader", daemon=True
         )
         self._reader_thread.start()
+        try:
+            self._isapi.refresh_capabilities()
+        except Exception:
+            pass
         return True
 
     def _reader_loop(self) -> None:
         assert self._cap is not None and self._stop_event is not None
+        try:
+            import cv2
+        except ImportError:
+            return
         while not self._stop_event.is_set():
             if self._cap is None or not self._cap.isOpened():
                 break
             ok, frame = self._cap.read()
             if ok and frame is not None:
+                h, w = frame.shape[:2]
+                if w > _PREVIEW_MAX_W:
+                    nh = max(1, int(h * (_PREVIEW_MAX_W / float(w))))
+                    frame = cv2.resize(
+                        frame, (_PREVIEW_MAX_W, nh), interpolation=cv2.INTER_AREA
+                    )
                 with self._frame_lock:
                     self._latest_bgr = frame
                     self._last_frame_ts = time.monotonic()
             else:
-                self._stop_event.wait(0.02)
+                self._stop_event.wait(0.01)
+
+    def snapshot_bgr(self) -> Optional[np.ndarray]:
+        blob = self._isapi.get_picture(101)
+        if blob:
+            try:
+                import cv2
+                arr = np.frombuffer(blob, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    return img
+            except Exception:
+                pass
+        return self.read_bgr()
 
     def close(self) -> None:
         if self._stop_event is not None:
@@ -167,6 +296,10 @@ class OpenCvCameraBackend:
             self._latest_bgr = None
             self._last_frame_ts = None
         self.opened_at = None
+        try:
+            self.ptz_stop()
+        except Exception:
+            pass
 
     def is_open(self) -> bool:
         return self._cap is not None and self._cap.isOpened()

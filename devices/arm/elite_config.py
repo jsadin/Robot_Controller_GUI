@@ -27,3 +27,7 @@ class EliteBackendConfig:
     rtsi_output_recipe: str = ""
     rtsi_input_recipe: str = ""
     rtsi_frequency_hz: float = 250.0
+    ranging_in_ext_script: bool = False
+    ranging_baud: int = 115200
+    ranging_parity: int = 0
+    ranging_slave: int = 1

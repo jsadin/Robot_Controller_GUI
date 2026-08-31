@@ -128,20 +128,32 @@ class ArmCfg:
 @dataclass
 class CameraCfg:
     kind: str = "hikvision"
-    host: str = "192.168.11.101"
+    host: str = "192.168.11.103"
     user: str = "admin"
     password: str = ""
     port: int = 554
-    stream_path: str = "/h264/ch1/main/av_stream"
+    stream_path: str = "/Streaming/Channels/102"
     rtsp_url: str = ""
     usb_index: int = 0
+    http_port: int = 80
+    ptz_channel: int = 1
+    zoom_speed: int = 50
+    auto_zoom: bool = True
+    auto_zoom_near_m: float = 1.0
+    auto_zoom_travel_ms: int = 8000
 
 
 @dataclass
 class RangingCfg:
     enabled: bool = False
-    host: str = ""
-    port: int = 0
+    kind: str = "stub"  # stub | elite_cabinet_rs485
+    host: str = ""  # 空则使用 arm.host
+    port: int = 0  # PC 回连端口，0=18770
+    slave: int = 1
+    baud: int = 115200
+    parity: int = 0  # 0无校验 1奇 2偶
+    ssh_password: str = ""  # 柜体 SSH，供 EliteDriver.startBoardRs485；空则走 30001 sec
+    rs485_tcp_port: int = 54322
 
 
 @dataclass
@@ -275,18 +287,33 @@ def load_devices_config(path: Optional[Path] = None) -> DevicesConfig:
         ),
         camera=CameraCfg(
             kind=str(ca.get("kind") or "hikvision"),
-            host=str(ca.get("host") or "192.168.11.101"),
+            host=str(ca.get("host") or "192.168.11.103"),
             user=str(ca.get("user") or "admin"),
             password=cam_password,
             port=int(ca.get("port") or 554),
-            stream_path=str(ca.get("stream_path") or "/h264/ch1/main/av_stream"),
+            stream_path=str(ca.get("stream_path") or "/Streaming/Channels/102"),
             rtsp_url=str(ca.get("rtsp_url") or ""),
             usb_index=int(ca.get("usb_index") or 0),
+            http_port=int(ca.get("http_port") or 80),
+            ptz_channel=int(ca.get("ptz_channel") or 1),
+            zoom_speed=int(ca.get("zoom_speed") or 50),
+            auto_zoom=bool(ca.get("auto_zoom", True)),
+            auto_zoom_near_m=float(ca.get("auto_zoom_near_m") or 1.0),
+            auto_zoom_travel_ms=int(ca.get("auto_zoom_travel_ms") or 8000),
         ),
         ranging=RangingCfg(
             enabled=bool(rg.get("enabled", False)),
+            kind=str(rg.get("kind") or "stub"),
             host=str(rg.get("host") or ""),
             port=int(rg.get("port") or 0),
+            slave=int(rg.get("slave") or 1),
+            baud=int(rg.get("baud") or 115200),
+            parity=int(rg.get("parity") if rg.get("parity") is not None else 0),
+            ssh_password=(
+                (os.environ.get("ROBOT_CABINET_SSH_PASSWORD") or "").strip()
+                or str(rg.get("ssh_password") or "").strip()
+            ),
+            rs485_tcp_port=int(rg.get("rs485_tcp_port") or 54322),
         ),
         data_dir=data_dir,
     )

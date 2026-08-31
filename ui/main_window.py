@@ -93,6 +93,7 @@ from devices.chassis.stcm import parse_stcm, parse_stcm_file
 from devices.config_loader import DevicesConfig, load_devices_config
 from devices.arm import ArmController
 from devices.camera import build_camera, save_snapshot, snapshot_path
+from devices.camera.auto_zoom import AutoZoomController, ranging_too_far
 from devices.ranging import build_ranging
 from devices.common import EStopBus
 from core import app_log
@@ -150,6 +151,7 @@ class MainWindow(QMainWindow):
         self.arm = ArmController(self.cfg)
         self.camera = build_camera(self.cfg)
         self.ranging = build_ranging(self.cfg)
+        self.ranging.bind_arm(self.arm)
         self.estop_bus = EStopBus()
         self.estop_bus.bind(arm=self.arm, stop_mission=lambda: None)
         self.arm_worker = ArmControlWorker(self.arm)
@@ -184,6 +186,9 @@ class MainWindow(QMainWindow):
         self.arm_panel.spin_speed.setValue(float(self.cfg.arm.max_joint_speed_deg_s))
         self.arm_panel.chk_limit.setChecked(bool(self.cfg.arm.speed_limit_enabled))
         self.vision_panel = VisionPanel()
+        self.vision_panel.set_auto_zoom(bool(self.cfg.camera.auto_zoom))
+        self._auto_zoom = AutoZoomController(near_m=float(self.cfg.camera.auto_zoom_near_m))
+        self._auto_zoom.set_enabled(self.vision_panel.is_auto_zoom())
         self.diagnosis_panel = DiagnosisPanel()
         self.mission_panel = MissionPanel(
             get_pois=self._mission_poi_choices,
@@ -315,6 +320,10 @@ class MainWindow(QMainWindow):
         self.vision_panel.closeRequested.connect(self.on_camera_close)
         self.vision_panel.snapshotRequested.connect(self.on_camera_snapshot)
         self.vision_panel.openFolderRequested.connect(self.on_open_snapshot_folder)
+        self.vision_panel.zoomStartRequested.connect(self.on_camera_zoom_start)
+        self.vision_panel.ptzStopRequested.connect(self.on_camera_ptz_stop)
+        self.vision_panel.autoZoomToggled.connect(self.on_auto_zoom_toggled)
+        self._apply_ptz_caps()
         self.diagnosis_panel.btn_refresh.clicked.connect(self.refresh_diagnosis)
         self.diagnosis_panel.exportRequested.connect(self.on_export_logs)
         self.mission_panel.runRequested.connect(self.on_mission_run)
@@ -412,8 +421,16 @@ class MainWindow(QMainWindow):
             self.status(f"已导入 {self._migrated_tasks_n} 条旧巡检任务到任务组")
 
         self.cam_timer = QTimer(self)
-        self.cam_timer.setInterval(100)
+        self.cam_timer.setInterval(33)
         self.cam_timer.timeout.connect(self.poll_camera)
+        self._cam_shown_ts = None
+        self._ptz_hold_timer = QTimer(self)
+        self._ptz_hold_timer.setSingleShot(True)
+        self._ptz_hold_timer.timeout.connect(self.on_camera_ptz_stop)
+        self._auto_zoom_timer = QTimer(self)
+        self._auto_zoom_timer.setInterval(500)
+        self._auto_zoom_timer.timeout.connect(self._tick_auto_zoom)
+        self._auto_zoom_manual = False
 
         # 静默连接须在首帧绘制之后分步执行；同步阻塞会导致白屏/假死
         self._boot_notes: list[str] = []
@@ -528,10 +545,14 @@ class MainWindow(QMainWindow):
             opened = bool(self.camera.open())
             if opened:
                 self.cam_timer.start()
+                self._apply_ptz_caps()
+                self._sync_auto_zoom_timer()
                 # 不阻塞等待首帧；由延时复检诊断刷新
                 self._boot_notes.append("摄像头已打开（等待首帧）")
             else:
-                self._boot_notes.append("摄像头打开失败")
+                getter = getattr(self.camera, "last_open_error", None)
+                detail = getter() if callable(getter) else ""
+                self._boot_notes.append(f"摄像头打开失败（{detail or '失败'}）")
         except Exception as e:
             self._boot_notes.append(f"摄像头异常（{e}）")
         QTimer.singleShot(0, self._boot_step_finish)
@@ -666,22 +687,38 @@ class MainWindow(QMainWindow):
     def on_camera_open(self) -> None:
         if self.camera.open():
             self.cam_timer.start()
+            self._apply_ptz_caps()
+            self._sync_auto_zoom_timer()
             self.status("摄像头已打开")
         else:
-            self.status("摄像头打开失败")
+            err = getattr(self.camera, "last_open_error", None)
+            detail = err() if callable(err) else (err or "")
+            host = getattr(self.cfg.camera, "host", "")
+            self.status(
+                f"摄像头打开失败（{detail or host or '请检查 IP/密码'}）"
+            )
         self.refresh_diagnosis()
         # 首帧晚到时再刷一次诊断
         QTimer.singleShot(2000, self.refresh_diagnosis)
 
     def on_camera_close(self) -> None:
         self.cam_timer.stop()
+        self._auto_zoom_timer.stop()
+        self._auto_zoom.reset()
+        self._cam_shown_ts = None
+        self.on_camera_ptz_stop()
         self.camera.close()
         self.vision_panel.view.setText("无画面")
         self.status("摄像头已关闭")
         self.refresh_diagnosis()
 
     def on_camera_snapshot(self) -> None:
-        frame = self.camera.read_bgr()
+        frame = None
+        snap = getattr(self.camera, "snapshot_bgr", None)
+        if callable(snap):
+            frame = snap()
+        if frame is None:
+            frame = self.camera.read_bgr()
         if frame is None:
             self.status("无画面可抓拍")
             return
@@ -712,7 +749,134 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.status(f"打开抓拍目录失败: {e}", pin_secs=5.0)
 
+    def _apply_ptz_caps(self) -> None:
+        available = bool(getattr(self.camera, "ptz_available", lambda: False)())
+        getter = getattr(self.camera, "ptz_caps", None)
+        caps = getter() if callable(getter) else {}
+        if not isinstance(caps, dict):
+            caps = {}
+        if caps.get("probed"):
+            self.vision_panel.set_ptz_enabled(
+                available,
+                zoom=bool(caps.get("zoom", True)),
+                detail=str(caps.get("detail") or ""),
+            )
+        else:
+            self.vision_panel.set_ptz_enabled(available)
+
+    def on_auto_zoom_toggled(self, on: bool) -> None:
+        self._auto_zoom.set_enabled(bool(on))
+        if not on:
+            self._auto_zoom_timer.stop()
+            self.on_camera_ptz_stop()
+            self.status("已取消自动变焦")
+            return
+        self._sync_auto_zoom_timer()
+        near_mm = float(self.cfg.camera.auto_zoom_near_m) * 1000.0
+        self.status(f"自动变焦：>{near_mm:.0f}mm/过远→最长焦，≤{near_mm:.0f}mm→最短焦")
+
+    def _sync_auto_zoom_timer(self) -> None:
+        cam_open = bool(getattr(self.camera, "is_open", lambda: False)())
+        ptz_ok = bool(getattr(self.camera, "ptz_available", lambda: False)())
+        if self._auto_zoom.enabled and cam_open and ptz_ok:
+            if not self._auto_zoom_timer.isActive():
+                self._auto_zoom_timer.start()
+            self._tick_auto_zoom()
+        else:
+            self._auto_zoom_timer.stop()
+
+    def _tick_auto_zoom(self) -> None:
+        if not self._auto_zoom.enabled:
+            return
+        if not bool(getattr(self.camera, "is_open", lambda: False)()):
+            return
+        if not bool(getattr(self.camera, "ptz_available", lambda: False)()):
+            return
+        dist = None
+        getter = getattr(self.ranging, "get_distance_m", None)
+        if callable(getter):
+            try:
+                dist = getter()
+            except Exception:
+                dist = None
+        err = ""
+        err_fn = getattr(self.ranging, "last_error", None)
+        if callable(err_fn):
+            err = err_fn() or ""
+        elif isinstance(err_fn, str):
+            err = err_fn
+        action = self._auto_zoom.tick(dist, too_far=ranging_too_far(err))
+        if action in ("start_max", "hold_max"):
+            if action == "start_max":
+                self._start_camera_zoom(1, travel_ms=int(self.cfg.camera.auto_zoom_travel_ms))
+                self.status(self._auto_zoom_status("最长焦", dist, err))
+            else:
+                self._keep_camera_zoom(1)
+        elif action in ("start_min", "hold_min"):
+            if action == "start_min":
+                self._start_camera_zoom(-1, travel_ms=int(self.cfg.camera.auto_zoom_travel_ms))
+                self.status(self._auto_zoom_status("最短焦", dist, err))
+            else:
+                self._keep_camera_zoom(-1)
+
+    def on_camera_zoom_start(self, direction: int) -> None:
+        if self.vision_panel.is_auto_zoom():
+            self.vision_panel.set_auto_zoom(False)
+            self._auto_zoom.set_enabled(False)
+            self._auto_zoom_timer.stop()
+            self._auto_zoom.reset()
+        self._auto_zoom_manual = True
+        self._start_camera_zoom(int(direction), travel_ms=8000)
+
+    def _auto_zoom_status(self, gear: str, dist: float | None, err: str) -> str:
+        if dist is not None:
+            return f"自动变焦→{gear}（{dist * 1000.0:.0f} mm）"
+        extra = (err or "无有效距离").strip()
+        return f"自动变焦→{gear}（{extra}）"
+
+    def _keep_camera_zoom(self, direction: int) -> None:
+        """行程中续发连续变倍，海康连续 PTZ 不续发容易自行停住。"""
+        fn = getattr(self.camera, "zoom_start", None)
+        if callable(fn):
+            fn(int(direction))
+
+    def _start_camera_zoom(self, direction: int, *, travel_ms: int) -> None:
+        fn = getattr(self.camera, "zoom_start", None)
+        if not callable(fn) or not fn(int(direction)):
+            err = ""
+            getter = getattr(self.camera, "ptz_last_error", None)
+            if callable(getter):
+                err = getter() or ""
+            self.status(err or "当前相机不支持 ISAPI 变焦（需 hikvision/rtsp + 网页端口）")
+            self._auto_zoom.reset()
+            return
+        ms = max(200, int(travel_ms))
+        self._ptz_hold_timer.start(ms)
+        if self._auto_zoom_manual:
+            self.status("变焦+" if direction >= 0 else "变焦-")
+
+    def on_camera_ptz_stop(self) -> None:
+        self._ptz_hold_timer.stop()
+        fn = getattr(self.camera, "ptz_stop", None)
+        if callable(fn):
+            fn()
+        if self._auto_zoom.enabled and not self._auto_zoom_manual:
+            self._auto_zoom.on_travel_done()
+        self._auto_zoom_manual = False
+        err = ""
+        getter = getattr(self.camera, "ptz_last_error", None)
+        if callable(getter):
+            err = getter() or ""
+        if err:
+            self.status(f"变焦失败: {err}", pin_secs=6.0)
+            app_log.log_warn("camera", err)
+
     def poll_camera(self) -> None:
+        ts = getattr(self.camera, "last_frame_ts", None)
+        ts = ts() if callable(ts) else ts
+        if ts is not None and ts == getattr(self, "_cam_shown_ts", None):
+            return
+        self._cam_shown_ts = ts
         self.vision_panel.show_bgr(self.camera.read_bgr())
 
     def refresh_diagnosis(self) -> None:
@@ -1044,9 +1208,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         try:
+            self._auto_zoom_timer.stop()
+            self._ptz_hold_timer.stop()
+            fn = getattr(self.camera, "ptz_stop", None)
+            if callable(fn):
+                fn()
             self.workspace.close_all_floats()
             self.arm_worker.stop()
             self.camera.close()
+            self.ranging.close()
             self.arm.disconnect()
         except Exception:
             pass

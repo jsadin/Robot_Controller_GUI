@@ -439,18 +439,27 @@ class DiagnosisAggregator:
             return DeviceStatus(
                 DeviceId.RANGING,
                 ConnectionState.DISCONNECTED,
-                "未启用(stub)",
+                "未启用",
                 ok=True,
             )
         d = self.ranging.get_distance_m()
         if d is None:
+            err = getattr(self.ranging, "last_error", None) or "读取中"
             return DeviceStatus(
-                DeviceId.RANGING, ConnectionState.DISCONNECTED, "无数据", ok=True
+                DeviceId.RANGING, ConnectionState.CONNECTING, str(err), ok=True
+            )
+        mm = d * 1000.0
+        if mm > 20000 or mm < 1:
+            return DeviceStatus(
+                DeviceId.RANGING,
+                ConnectionState.CONNECTING,
+                f"读数异常 {mm:.1f} mm",
+                ok=True,
             )
         return DeviceStatus(
             DeviceId.RANGING,
             ConnectionState.CONNECTED,
-            f"{d:.3f} m",
+            f"{d * 1000:.1f} mm",
             metrics={"distance_m": d},
             ok=True,
         )
