@@ -138,7 +138,7 @@ class HikvisionIsapi:
             return None
         path = f"/ISAPI/Streaming/channels/{int(channel)}/picture"
         try:
-            r = self._request("GET", path, timeout=4.0)
+            r = self._request("GET", path, timeout=2.5)
             if r is not None and r.status_code == 200 and r.content:
                 return bytes(r.content)
         except Exception as e:

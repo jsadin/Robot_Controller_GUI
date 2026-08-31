@@ -57,6 +57,17 @@ class TestConfigAndDevices(unittest.TestCase):
         frame = cam.read_bgr()
         self.assertIsNotNone(frame)
         self.assertEqual(frame.shape[2], 3)
+        jpeg = cam.snapshot_jpeg()
+        self.assertIsNotNone(jpeg)
+        self.assertGreater(len(jpeg), 32)
+        self.assertEqual(jpeg[:2], b"\xff\xd8")
+        from devices.camera import save_snapshot_bytes
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "snap.jpg"
+            save_snapshot_bytes(jpeg, out)
+            self.assertTrue(out.is_file())
+            self.assertGreater(out.stat().st_size, 32)
         cam.close()
         self.assertFalse(cam.ptz_available())
 

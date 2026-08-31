@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -92,7 +93,7 @@ from devices.chassis.client import MOVE_MODE_FREE, MOVE_MODE_TRACK_FIRST
 from devices.chassis.stcm import parse_stcm, parse_stcm_file
 from devices.config_loader import DevicesConfig, load_devices_config
 from devices.arm import ArmController
-from devices.camera import build_camera, save_snapshot, snapshot_path
+from devices.camera import build_camera, save_snapshot_bytes, snapshot_path
 from devices.camera.auto_zoom import AutoZoomController, ranging_too_far
 from devices.ranging import build_ranging
 from devices.common import EStopBus
@@ -118,6 +119,7 @@ class MainWindow(QMainWindow):
     # 任务组执行线程 → 主线程（QueuedConnection，勿用跨线程 QTimer.singleShot）
     missionProgress = pyqtSignal(object)  # dict 快照
     missionStatusMsg = pyqtSignal(str)
+    snapshotFinished = pyqtSignal(object, object)  # path | None, err | None
 
     def __init__(
         self,
@@ -146,6 +148,8 @@ class MainWindow(QMainWindow):
 
         self.missionProgress.connect(self._on_mission_progress_snap)
         self.missionStatusMsg.connect(self.status)
+        self.snapshotFinished.connect(self._on_snapshot_finished)
+        self._snap_busy = False
 
         self.client: HermesClient | None = None
         self.arm = ArmController(self.cfg)
@@ -713,25 +717,39 @@ class MainWindow(QMainWindow):
         self.refresh_diagnosis()
 
     def on_camera_snapshot(self) -> None:
-        frame = None
-        snap = getattr(self.camera, "snapshot_bgr", None)
-        if callable(snap):
-            frame = snap()
-        if frame is None:
-            frame = self.camera.read_bgr()
-        if frame is None:
-            self.status("无画面可抓拍")
+        if self._snap_busy:
+            self.status("正在抓拍…")
             return
-        from datetime import datetime as _dt
-        stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
-        path = snapshot_path(self.cfg.data_dir, f"snap_{stamp}.jpg")
+        self._snap_busy = True
+        self.status("正在抓拍…")
+        threading.Thread(
+            target=self._snapshot_worker, name="camera-snap", daemon=True
+        ).start()
+
+    def _snapshot_worker(self) -> None:
         try:
-            save_snapshot(frame, path)
-            self.status("已抓拍 " + str(path), pin_secs=6.0)
-            app_log.log_info("snapshot", str(path))
+            jpeg = None
+            fn = getattr(self.camera, "snapshot_jpeg", None)
+            if callable(fn):
+                jpeg = fn()
+            if not jpeg:
+                self.snapshotFinished.emit(None, "无画面可抓拍")
+                return
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = snapshot_path(self.cfg.data_dir, f"snap_{stamp}.jpg")
+            save_snapshot_bytes(jpeg, path)
+            self.snapshotFinished.emit(str(path), None)
         except Exception as e:
-            self.status("抓拍失败: " + str(e), pin_secs=6.0)
-            app_log.log_error("snapshot", str(e))
+            self.snapshotFinished.emit(None, str(e))
+
+    def _on_snapshot_finished(self, path, err) -> None:
+        self._snap_busy = False
+        if err:
+            self.status("抓拍失败: " + str(err), pin_secs=6.0)
+            app_log.log_error("snapshot", str(err))
+            return
+        self.status("已抓拍 " + str(path), pin_secs=6.0)
+        app_log.log_info("snapshot", str(path))
 
     def on_open_snapshot_folder(self) -> None:
         """打开当前 data_dir 下的抓拍根目录（按日分子目录）。"""

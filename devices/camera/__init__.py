@@ -33,6 +33,7 @@ class CameraBackend(Protocol):
     def ptz_caps(self) -> dict: ...
     def refresh_ptz_caps(self) -> dict: ...
     def snapshot_bgr(self) -> Optional[np.ndarray]: ...
+    def snapshot_jpeg(self) -> Optional[bytes]: ...
 
 
 def build_hikvision_rtsp_url(
@@ -125,6 +126,9 @@ class MockCameraBackend:
 
     def snapshot_bgr(self) -> Optional[np.ndarray]:
         return self.read_bgr()
+
+    def snapshot_jpeg(self) -> Optional[bytes]:
+        return _encode_jpeg(self.read_bgr())
 
 
 # OpenCV FFmpeg：低延迟（旧值 max_delay=500ms 会明显拖后变焦画面）
@@ -270,17 +274,15 @@ class OpenCvCameraBackend:
                 self._stop_event.wait(0.01)
 
     def snapshot_bgr(self) -> Optional[np.ndarray]:
-        blob = self._isapi.get_picture(101)
-        if blob:
-            try:
-                import cv2
-                arr = np.frombuffer(blob, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if img is not None:
-                    return img
-            except Exception:
-                pass
+        """预览帧。高清抓拍请用 snapshot_jpeg，避免主线程 imdecode 卡住 servoj。"""
         return self.read_bgr()
+
+    def snapshot_jpeg(self) -> Optional[bytes]:
+        """优先 ISAPI 主码流 JPEG（已是压缩数据，直接落盘）；失败则编码预览帧。"""
+        blob = self._isapi.get_picture(101)
+        if blob and len(blob) >= 32 and blob[:2] == b"\xff\xd8":
+            return blob
+        return _encode_jpeg(self.read_bgr())
 
     def close(self) -> None:
         if self._stop_event is not None:
@@ -361,6 +363,32 @@ def snapshot_path(data_dir, filename: str, when=None):
 def video_day_dir(data_dir, when=None):
     """按日期归档视频目录：``{data_dir}/videos/YYYY-MM-DD/``（预留）。"""
     return media_day_dir(data_dir, when=when, kind="videos")
+
+
+def _encode_jpeg(frame: Optional[np.ndarray]) -> Optional[bytes]:
+    if frame is None:
+        return None
+    try:
+        import cv2
+    except ImportError:
+        return None
+    ok, buf = cv2.imencode(".jpg", frame)
+    if not ok:
+        return None
+    return bytes(buf.tobytes())
+
+
+def save_snapshot_bytes(data: bytes, path) -> None:
+    from pathlib import Path
+
+    raw = bytes(data or b"")
+    if len(raw) < 32:
+        raise OSError("empty jpeg")
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(raw)
+    if not p.is_file() or p.stat().st_size <= 0:
+        raise OSError(f"snapshot not written: {p}")
 
 
 def save_snapshot(frame: np.ndarray, path) -> None:

@@ -15,7 +15,7 @@ from typing import Callable, List, Optional, Sequence
 
 from devices.arm.controller import ArmController
 from devices.arm.sequences import default_poses_path, default_sequences_path, load_poses, load_sequences
-from devices.camera import CameraBackend, save_snapshot, snapshot_path
+from devices.camera import CameraBackend, save_snapshot, save_snapshot_bytes, snapshot_path
 from devices.chassis import ChassisClient, HermesError
 
 # 经 ArmControlWorker 下发位姿（与动作组 UI 同路径，避免与 worker 抢写期望角）
@@ -464,18 +464,6 @@ class MissionExecutor:
             if raise_on_fail:
                 raise RuntimeError(msg)
             return False
-        frame = None
-        snap = getattr(self.camera, "snapshot_bgr", None)
-        if callable(snap):
-            frame = snap()
-        if frame is None:
-            frame = self.camera.read_bgr()
-        if frame is None:
-            msg = "抓拍失败：无画面（请先打开摄像头）"
-            self.on_status(msg)
-            if raise_on_fail:
-                raise RuntimeError(msg)
-            return False
         now = datetime.now()
         path = snapshot_path(
             self.data_dir,
@@ -483,7 +471,21 @@ class MissionExecutor:
             when=now,
         )
         try:
-            save_snapshot(frame, path)
+            jpeg = None
+            fn = getattr(self.camera, "snapshot_jpeg", None)
+            if callable(fn):
+                jpeg = fn()
+            if jpeg:
+                save_snapshot_bytes(jpeg, path)
+            else:
+                frame = self.camera.read_bgr()
+                if frame is None:
+                    msg = "抓拍失败：无画面（请先打开摄像头）"
+                    self.on_status(msg)
+                    if raise_on_fail:
+                        raise RuntimeError(msg)
+                    return False
+                save_snapshot(frame, path)
         except Exception as e:
             msg = f"抓拍失败：{e}"
             self.on_status(msg)
