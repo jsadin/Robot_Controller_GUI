@@ -129,7 +129,11 @@ class TestConfigAndDevices(unittest.TestCase):
         self.assertIsNone(parse_ranging_reply("True;[]"))
         self.assertIsNone(distance_m_from_input_regs(32767, 65535))
         self.assertIsNone(parse_ranging_reply("True;[32767, 65535]"))
+        from devices.arm.cabinet_rs485 import _BRIDGE_PY, _stty_uart
         from devices.ranging import hf_read_distance_frame
+
+        self.assertIn("termios.B115200", _BRIDGE_PY)
+        self.assertIn("readlink -f", _stty_uart("/dev/ttyBoard", 115200))
 
         self.assertEqual(hf_read_distance_frame(1), [1, 4, 0, 0, 0, 2, 0x71, 0xCB])
         from devices.ranging import parse_modbus_fc04_distance

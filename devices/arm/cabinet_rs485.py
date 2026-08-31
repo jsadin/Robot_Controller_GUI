@@ -13,10 +13,27 @@ from pathlib import Path
 _SSH_USERS = ("root", "elibot")
 
 _BRIDGE_PY = r"""
-import os, select, socket, sys
+import os, select, socket, sys, termios
 PORT = int(sys.argv[1])
 DEV = sys.argv[2]
+BAUD = int(sys.argv[3]) if len(sys.argv) > 3 else 115200
+if os.path.islink(DEV):
+    DEV = os.path.realpath(DEV)
 fd = os.open(DEV, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+try:
+    bmap = {9600: termios.B9600, 19200: termios.B19200, 38400: termios.B38400,
+            57600: termios.B57600, 115200: termios.B115200}
+    b = bmap.get(BAUD, termios.B115200)
+    a = termios.tcgetattr(fd)
+    a[0] = 0
+    a[1] = 0
+    a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+    a[3] = 0
+    a[4] = b
+    a[5] = b
+    termios.tcsetattr(fd, termios.TCSANOW, a)
+except Exception:
+    pass
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(('0.0.0.0', PORT))
@@ -141,6 +158,16 @@ def tcp_open(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
+def _stty_uart(device: str, baud: int) -> str:
+    """解析 ttyBoard 软链后设 8N1。勿对软链本身 ioctl。"""
+    return (
+        f'DEV="{device}"; '
+        'if [ -L "$DEV" ]; then DEV=$(readlink -f "$DEV"); fi; '
+        f'stty -F "$DEV" {int(baud)} raw -echo cs8 -cstopb -parenb >/dev/null 2>&1 || true; '
+        'stty -F "$DEV" 2>/dev/null | head -n 1'
+    )
+
+
 def ensure_python_bridge(
     host: str,
     password: str,
@@ -150,19 +177,25 @@ def ensure_python_bridge(
     parity: int = 0,
     device: str = "/dev/ttyBoard",
 ) -> str | None:
-    """柜体无 socat：用自带 python3 把 tty 映射到 TCP。失败返回错误串。"""
-    if tcp_open(host, tcp_port, 0.8):
-        return None
+    """柜体无 socat：用自带 python3 把 tty 映射到 TCP。失败返回错误串。
+
+    即使 54322 已在听，也要先 stty：旧桥常按内核默认 9600 打开 ttyS2，
+    而现场 HF 是 115200，否则读回空帧、误报 SSH 密码错误。
+    外部控制运行中禁止往 30001 发 sec。
+    """
     user = ssh_login_user(host, password)
     if not user:
-        return "SSH 登录失败（用户 root/elibot）"
-    # 外部控制运行中禁止往 30001 发 sec：失败会停掉主任务，机械臂随即不动。
+        return "SSH 登录失败（用户 root/elibot，检查 ranging.ssh_password）"
+    _c, stty_out, _e = ssh_run(host, password, user, _stty_uart(device, baud))
+    listening = tcp_open(host, tcp_port, 0.8)
+    if listening and str(int(baud)) in (stty_out or ""):
+        return None
     b64 = base64.b64encode(_BRIDGE_PY.encode("ascii")).decode("ascii")
     start = (
         "if [ -f /tmp/board_rs485_bridge.pid ]; then "
         "kill $(cat /tmp/board_rs485_bridge.pid) >/dev/null 2>&1 || true; fi; "
         f"python3 -c \"open('/tmp/board_rs485_bridge.py','w').write(__import__('base64').b64decode('{b64}').decode())\"; "
-        f"nohup python3 /tmp/board_rs485_bridge.py {int(tcp_port)} {device} "
+        f"nohup python3 /tmp/board_rs485_bridge.py {int(tcp_port)} {device} {int(baud)} "
         f">/tmp/board_rs485_bridge.log 2>&1 & echo $! >/tmp/board_rs485_bridge.pid; "
         "echo PID:$(cat /tmp/board_rs485_bridge.pid); sleep 0.4"
     )

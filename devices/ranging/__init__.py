@@ -383,7 +383,7 @@ class EliteCabinetRanging(RangingBackend):
         except Exception as e:
             return None, f"柜体 485 读取失败: {e}"
         if not raw:
-            return None, "柜体 SSH/485 无应答（检查 ranging.ssh_password）"
+            return None, "柜体 485 无数据（串口已通但测距仪无应答，检查波特率/接线）"
         raw_b = bytes(raw)
         if len(raw_b) >= 7 and raw_b[3:7] == b"\x7f\xff\xff\xff":
             return None, "测距仪已应答但无有效距离(0x7FFFFFFF)，请将目标放在量程内"

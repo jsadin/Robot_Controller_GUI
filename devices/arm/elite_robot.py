@@ -512,24 +512,21 @@ class EliteCsRobotBackend:
         if self._board_rs485 is None and not self._board_rs485_bridge_ok:
             # 不要调用 SDK startBoardRs485：它会向 30001 下发 sec，
             # 失败时控制器会停掉外部控制，表现为连上后几秒机械臂不再动。
-            from devices.arm.cabinet_rs485 import ensure_python_bridge, tcp_open
+            # 端口已在听也不能跳过：必须 stty 成现场波特率（默认 9600 ≠ HF 115200）。
+            from devices.arm.cabinet_rs485 import ensure_python_bridge
 
-            if tcp_open(self._cfg.robot_ip, int(tcp_port), 0.8):
-                self._board_rs485_bridge_ok = True
-                self._board_rs485_password = str(ssh_password)
-            else:
-                err = ensure_python_bridge(
-                    self._cfg.robot_ip,
-                    str(ssh_password),
-                    tcp_port=int(tcp_port),
-                    baud=int(baud),
-                    parity=int(parity),
-                )
-                if err:
-                    print(f"[elite_teleop_gui] cabinet 485 bridge: {err}", file=sys.stderr)
-                    return None
-                self._board_rs485_bridge_ok = True
-                self._board_rs485_password = str(ssh_password)
+            err = ensure_python_bridge(
+                self._cfg.robot_ip,
+                str(ssh_password),
+                tcp_port=int(tcp_port),
+                baud=int(baud),
+                parity=int(parity),
+            )
+            if err:
+                print(f"[elite_teleop_gui] cabinet 485 bridge: {err}", file=sys.stderr)
+                raise RuntimeError(err)
+            self._board_rs485_bridge_ok = True
+            self._board_rs485_password = str(ssh_password)
         if self._board_rs485 is not None:
             try:
                 self._board_rs485.write(payload)
